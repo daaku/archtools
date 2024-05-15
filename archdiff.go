@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
@@ -215,11 +216,11 @@ func (a *App) buildModifiedBackupFile() error {
 		if a.isIgnored(fullname) {
 			continue
 		}
-		if _, err := os.Stat(fullname); os.IsNotExist(err) {
-			continue
-		}
 		actual, err := filehash(fullname)
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			return errors.WithStack(err)
 		}
 		if actual != hash {
