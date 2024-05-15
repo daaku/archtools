@@ -34,7 +34,7 @@ func (g simpleGlob) Match(path string) bool {
 	if path == string(g) {
 		return true
 	}
-	return strings.HasPrefix(path, string(g)+"/")
+	return strings.HasPrefix(path, string(g)) && len(g) > len(path) && g[len(path)] == '/'
 }
 
 func filehash(path string) (string, error) {
