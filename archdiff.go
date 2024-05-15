@@ -18,7 +18,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Jguer/go-alpm"
+	"github.com/Jguer/go-alpm/v2"
 	"github.com/gobwas/glob"
 	"github.com/pkg/errors"
 )
@@ -64,7 +64,7 @@ type App struct {
 	IgnoreDir  string
 	CpuProfile string
 
-	localDB *alpm.DB
+	localDB alpm.IDB
 	alpm    *alpm.Handle
 
 	ignoreGlob         []Glob
@@ -158,7 +158,7 @@ func (a *App) buildAllFile() error {
 }
 
 func (a *App) buildPackageFile() error {
-	err := a.localDB.PkgCache().ForEach(func(pkg alpm.Package) error {
+	err := a.localDB.PkgCache().ForEach(func(pkg alpm.IPackage) error {
 		for _, file := range pkg.Files() {
 			a.packageFile = append(a.packageFile, filepath.Join("/", file.Name))
 		}
@@ -171,7 +171,7 @@ func (a *App) buildPackageFile() error {
 func (a *App) buildBackupFile() error {
 	a.backupFile = make(map[string]string)
 	return errors.WithStack(
-		a.localDB.PkgCache().ForEach(func(pkg alpm.Package) error {
+		a.localDB.PkgCache().ForEach(func(pkg alpm.IPackage) error {
 			return pkg.Backup().ForEach(func(bf alpm.BackupFile) error {
 				a.backupFile[filepath.Join("/", bf.Name)] = bf.Hash
 				return nil
