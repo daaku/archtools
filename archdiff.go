@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/pprof"
+	"slices"
 	"sort"
 	"strings"
 
@@ -285,13 +286,7 @@ func Main() error {
 		}
 	}
 
-	diff := make([]string, 0,
-		len(app.unpackagedFile)+
-			len(app.modifiedRepoFile)+
-			len(app.modifiedBackupFile))
-	diff = append(diff, app.unpackagedFile...)
-	diff = append(diff, app.modifiedRepoFile...)
-	diff = append(diff, app.modifiedBackupFile...)
+	diff := slices.Concat(app.unpackagedFile, app.modifiedRepoFile, app.modifiedBackupFile)
 	sort.Strings(diff)
 
 	for _, file := range diff {
