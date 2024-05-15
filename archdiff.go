@@ -102,7 +102,7 @@ func (a *App) buildIgnoreGlob() error {
 				if l[0] == '#' {
 					continue
 				}
-				if strings.IndexAny(l, "*?[") > -1 {
+				if strings.ContainsAny(l, "*?[") {
 					g, err := glob.Compile(l)
 					if err != nil {
 						return errors.WithStack(err)
