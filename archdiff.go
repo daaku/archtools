@@ -19,9 +19,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Jguer/go-alpm/v2"
 	"github.com/gobwas/glob"
+	"github.com/mattn/go-zglob/fastwalk"
 	"github.com/pkg/errors"
 )
 
@@ -80,12 +82,10 @@ type App struct {
 }
 
 func (a *App) buildIgnoreGlob() error {
-	return errors.WithStack(filepath.Walk(
+	var m sync.Mutex
+	return errors.WithStack(fastwalk.FastWalk(
 		a.IgnoreDir,
-		func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return errors.WithStack(err)
-			}
+		func(path string, info os.FileMode) error {
 			if info.IsDir() {
 				return nil
 			}
@@ -104,6 +104,7 @@ func (a *App) buildIgnoreGlob() error {
 				if l[0] == '#' {
 					continue
 				}
+				m.Lock()
 				if strings.ContainsAny(l, "*?[") {
 					g, err := glob.Compile(l)
 					if err != nil {
@@ -113,6 +114,7 @@ func (a *App) buildIgnoreGlob() error {
 				} else {
 					a.ignoreGlob = append(a.ignoreGlob, simpleGlob(l))
 				}
+				m.Unlock()
 			}
 			return errors.WithStack(sc.Err())
 		},
@@ -139,11 +141,12 @@ func (a *App) initAlpm() error {
 }
 
 func (a *App) buildAllFile() error {
-	return errors.WithStack(filepath.Walk(
+	var m sync.Mutex
+	return errors.WithStack(fastwalk.FastWalk(
 		a.Root,
-		func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return errors.WithStack(err)
+		func(path string, info os.FileMode) error {
+			if strings.HasPrefix(path, "//") {
+				path = path[1:]
 			}
 			if a.isIgnored(path) {
 				if info.IsDir() {
@@ -154,7 +157,9 @@ func (a *App) buildAllFile() error {
 			if info.IsDir() {
 				return nil
 			}
+			m.Lock()
 			a.allFile = append(a.allFile, path)
+			m.Unlock()
 			return nil
 		}))
 }
@@ -182,16 +187,16 @@ func (a *App) buildBackupFile() error {
 }
 
 func (a *App) buildRepoFile() error {
-	err := filepath.Walk(a.Repo,
-		func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
+	var m sync.Mutex
+	err := fastwalk.FastWalk(a.Repo,
+		func(path string, info os.FileMode) error {
 			if info.IsDir() {
 				return nil
 			}
 			name := strings.Replace(path, a.Repo, "", 1)
+			m.Lock()
 			a.repoFile = append(a.repoFile, name)
+			m.Unlock()
 			return nil
 		})
 	sort.Strings(a.repoFile)
