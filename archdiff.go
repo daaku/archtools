@@ -145,6 +145,7 @@ func (a *App) buildAllFile() error {
 	return errors.WithStack(fastwalk.FastWalk(
 		a.Root,
 		func(path string, info os.FileMode) error {
+			// an artifact of fastwalk.FastWalk somehow
 			if strings.HasPrefix(path, "//") {
 				path = path[1:]
 			}
