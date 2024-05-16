@@ -105,16 +105,17 @@ func (a *App) buildIgnoreGlob() error {
 				if l[0] == '#' {
 					continue
 				}
-				m.Lock()
+				var g Glob
 				if strings.ContainsAny(l, "*?[") {
-					g, err := glob.Compile(l)
+					g, err = glob.Compile(l)
 					if err != nil {
 						return errors.WithStack(err)
 					}
-					a.ignoreGlob = append(a.ignoreGlob, g)
 				} else {
-					a.ignoreGlob = append(a.ignoreGlob, simpleGlob(l))
+					g = simpleGlob(l)
 				}
+				m.Lock()
+				a.ignoreGlob = append(a.ignoreGlob, g)
 				m.Unlock()
 			}
 			return errors.WithStack(sc.Err())
