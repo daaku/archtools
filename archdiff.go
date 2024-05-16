@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"crypto/md5"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -50,7 +51,7 @@ func filehash(path string) (string, error) {
 	if _, err := io.Copy(h, file); err != nil {
 		return "", errors.WithStack(err)
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func contains(a []string, x string) bool {
