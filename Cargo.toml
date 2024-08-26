@@ -5,7 +5,7 @@ authors = ["Naitik Shah <n@daaku.org>"]
 edition = "2018"
 
 [dependencies]
-alpm = "3.0"
+alpm = "4.0"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 ignore = "0.4"
