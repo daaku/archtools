@@ -132,6 +132,15 @@ func (a *App) isIgnored(path string) bool {
 	return false
 }
 
+func (a *App) isIgnoredOrDir(path string) bool {
+	for n := path; n != "/"; n = filepath.Dir(n) {
+		if a.isIgnored(n) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) initAlpm() error {
 	var err error
 	a.alpm, err = alpm.Initialize(a.Root, a.DB)
@@ -221,7 +230,7 @@ func (a *App) buildModifiedBackupFile() error {
 			continue
 		}
 		fullname := filepath.Join(a.Root, file)
-		if a.isIgnored(fullname) {
+		if a.isIgnoredOrDir(fullname) {
 			continue
 		}
 		actual, err := filehash(fullname)
