@@ -67,7 +67,7 @@ type App struct {
 	DB         string
 	Repo       string
 	IgnoreDir  string
-	CpuProfile string
+	CPUProfile string
 
 	localDB alpm.IDB
 	alpm    *alpm.Handle
@@ -274,11 +274,11 @@ func Main() error {
 	flag.StringVar(&app.Repo, "repo", "/usr/share/archdiff", "repo directory")
 	flag.StringVar(&app.IgnoreDir, "ignore", "/etc/archdiff/ignore",
 		"directory of ignore files")
-	flag.StringVar(&app.CpuProfile, "cpuprofile", "", "write cpu profile here")
+	flag.StringVar(&app.CPUProfile, "cpuprofile", "", "write cpu profile here")
 	flag.Parse()
 
-	if app.CpuProfile != "" {
-		f, err := os.Create(app.CpuProfile)
+	if app.CPUProfile != "" {
+		f, err := os.Create(app.CPUProfile)
 		if err != nil {
 			return errors.WithStack(err)
 		}
