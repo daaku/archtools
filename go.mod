@@ -1,6 +1,6 @@
-module github.com/daaku/archdiff
+module github.com/daaku/archtools
 
-go 1.22.3
+go 1.25
 
 require (
 	github.com/Jguer/go-alpm/v2 v2.2.2
