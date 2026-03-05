@@ -65,7 +65,6 @@ func contains(a []string, x string) bool {
 type App struct {
 	Root       string
 	DB         string
-	Repo       string
 	IgnoreDir  string
 	CPUProfile string
 
@@ -76,10 +75,8 @@ type App struct {
 	backupFile         map[string]string
 	allFile            []string
 	packageFile        []string
-	repoFile           []string
 	modifiedBackupFile []string
 	unpackagedFile     []string
-	modifiedRepoFile   []string
 }
 
 func (a *App) buildIgnoreGlob() error {
@@ -198,23 +195,6 @@ func (a *App) buildBackupFile() error {
 		}))
 }
 
-func (a *App) buildRepoFile() error {
-	var m sync.Mutex
-	err := fastwalk.FastWalk(a.Repo,
-		func(path string, info os.FileMode) error {
-			if info.IsDir() {
-				return nil
-			}
-			name := strings.Replace(path, a.Repo, "", 1)
-			m.Lock()
-			a.repoFile = append(a.repoFile, name)
-			m.Unlock()
-			return nil
-		})
-	sort.Strings(a.repoFile)
-	return errors.WithStack(err)
-}
-
 func (a *App) buildUnpackagedFile() error {
 	for _, file := range a.allFile {
 		if !contains(a.packageFile, file) {
@@ -226,9 +206,6 @@ func (a *App) buildUnpackagedFile() error {
 
 func (a *App) buildModifiedBackupFile() error {
 	for file, hash := range a.backupFile {
-		if contains(a.repoFile, file) {
-			continue
-		}
 		fullname := filepath.Join(a.Root, file)
 		if a.isIgnoredOrDir(fullname) {
 			continue
@@ -247,31 +224,11 @@ func (a *App) buildModifiedBackupFile() error {
 	return nil
 }
 
-func (a *App) buildModifiedRepoFile() error {
-	for _, file := range a.repoFile {
-		realpath := filepath.Join(a.Root, file)
-		repopath := filepath.Join(a.Repo, file)
-		realhash, err := filehash(realpath)
-		if err != nil && !os.IsNotExist(err) {
-			return errors.WithStack(err)
-		}
-		repohash, err := filehash(repopath)
-		if err != nil && !os.IsNotExist(err) {
-			return errors.WithStack(err)
-		}
-		if realhash != repohash {
-			a.modifiedRepoFile = append(a.modifiedRepoFile, file)
-		}
-	}
-	return nil
-}
-
 func Main() error {
 	var app App
 	flag.StringVar(&app.Root, "root", "/", "set an alternate installation root")
 	flag.StringVar(
 		&app.DB, "dbpath", "/var/lib/pacman", "set an alternate database location")
-	flag.StringVar(&app.Repo, "repo", "/usr/share/archdiff", "repo directory")
 	flag.StringVar(&app.IgnoreDir, "ignore", "/etc/archdiff/ignore",
 		"directory of ignore files")
 	flag.StringVar(&app.CPUProfile, "cpuprofile", "", "write cpu profile here")
@@ -293,10 +250,8 @@ func Main() error {
 		app.buildAllFile,
 		app.buildPackageFile,
 		app.buildBackupFile,
-		app.buildRepoFile,
 		app.buildUnpackagedFile,
 		app.buildModifiedBackupFile,
-		app.buildModifiedRepoFile,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -304,7 +259,7 @@ func Main() error {
 		}
 	}
 
-	diff := slices.Concat(app.unpackagedFile, app.modifiedRepoFile, app.modifiedBackupFile)
+	diff := slices.Concat(app.unpackagedFile, app.modifiedBackupFile)
 	sort.Strings(diff)
 
 	for _, file := range diff {
