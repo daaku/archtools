@@ -350,7 +350,6 @@ func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
 		}
 		fmt.Fprintln(&ignore, ignorePath)
 
-		// FIXME only run if diff
 		diff, err := f.IsDiff(sftpClient)
 		if err != nil {
 			return err
