@@ -478,8 +478,10 @@ func run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for _, name := range a.Names {
 		wg.Go(func() {
-			// FIXME no prefix if only one name
-			prefix := fmt.Appendf(nil, "%s: ", name)
+			var prefix []byte
+			if len(a.Names) > 1 {
+				prefix = fmt.Appendf(nil, "%s: ", name)
+			}
 			stdout := new(bytes.Buffer)
 			s, err := a.Named(name)
 			if err == nil {

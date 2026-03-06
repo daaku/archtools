@@ -17,6 +17,11 @@ well for a very long time and I still enjoy it.
 - `archpets` helps you use a package repository to share configuration files
   across your systems.
 
+## FAQs
+
+1. How do you bootstrap a new system?
+1. How do you migrate an existing system to use this?
+
 ## archdiff
 
 ArchDiff provides a way to see a "diff" for your entire [Arch
