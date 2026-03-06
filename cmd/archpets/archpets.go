@@ -68,8 +68,6 @@ func (c *SourceConfig) FileMeta(filename string, dir bool) (FileMeta, error) {
 			return FileMeta{}, errors.WithStack(err)
 		}
 		if match {
-			println(pattern, filename)
-			fmt.Printf("%#v\n", meta)
 			if meta.Mode == 0 {
 				meta.Mode = mode
 			}
