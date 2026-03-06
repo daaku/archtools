@@ -151,6 +151,9 @@ func (t *FileSymlink) DestPath() string {
 func (t *FileSymlink) IsDiff(client *sftp.Client) (bool, error) {
 	current, err := client.ReadLink(t.destPath)
 	if err != nil {
+		if serrors.Is(err, fs.ErrNotExist) {
+			return true, nil
+		}
 		return false, errors.WithStack(err)
 	}
 	return current != t.targetPath, nil
@@ -158,6 +161,11 @@ func (t *FileSymlink) IsDiff(client *sftp.Client) (bool, error) {
 
 func (t *FileSymlink) Run(client *sftp.Client) error {
 	client.Remove(t.destPath) // ignore error
+	// FIXME perms
+	err := client.MkdirAll(filepath.Dir(t.destPath), 0o755)
+	if err != nil {
+		return errors.WithStack(err)
+	}
 	if err := client.Symlink(t.targetPath, t.destPath); err != nil {
 		return errors.WithStack(err)
 	}
@@ -168,6 +176,7 @@ type System struct {
 	Name   string
 	Source string
 	Host   string `toml:"host"`
+	Port   int    `toml:"port"`
 	Root   string
 }
 
@@ -298,6 +307,7 @@ func (a *App) Named(systemName string) (System, error) {
 	s := System{
 		Name: systemName,
 		Root: a.Root,
+		Port: 22,
 	}
 	err = toml.NewDecoder(bytes.NewReader(configBytes)).
 		DisallowUnknownFields().
@@ -334,7 +344,7 @@ func (a *App) CmdLs(ctx context.Context, s System, stdout io.Writer) error {
 }
 
 func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
-	client, err := connectToHost(s.Host)
+	client, err := connectToHost(s)
 	if err != nil {
 		return err
 	}
@@ -416,7 +426,7 @@ func getSSHAuthMethods() []ssh.AuthMethod {
 	return methods
 }
 
-func connectToHost(host string) (*ssh.Client, error) {
+func connectToHost(s System) (*ssh.Client, error) {
 	config := &ssh.ClientConfig{
 		// FIXME: make user optional for safer testing
 		// User:            currentUser.Username,
@@ -426,7 +436,7 @@ func connectToHost(host string) (*ssh.Client, error) {
 		Timeout:         15 * time.Second,
 	}
 
-	addr := net.JoinHostPort(host, "22")
+	addr := net.JoinHostPort(s.Host, fmt.Sprint(s.Port))
 	client, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, errors.WithStack(err)
