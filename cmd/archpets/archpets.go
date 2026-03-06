@@ -36,6 +36,52 @@ type File interface {
 	IsDiff(client *sftp.Client) (bool, error)
 }
 
+func atomicallyReplace(
+	client *sftp.Client,
+	filename string,
+	mode fs.FileMode,
+	src io.Reader,
+) error {
+	open := func() (string, *sftp.File, error) {
+		// FIXME perms
+		err := client.MkdirAll(filepath.Dir(filename), 0o755)
+		if err != nil {
+			return "", nil, errors.WithStack(err)
+		}
+		for i := range 10 {
+			name := fmt.Sprintf("%s.pets.%d", filename, i)
+			f, err := client.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_EXCL, mode)
+			if err == nil {
+				return name, f, nil
+			}
+		}
+		return "", nil, errors.Errorf("giving up creating temp file after 10 tries for %q", filename)
+	}
+
+	tempPath, dst, err := open()
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		client.Remove(tempPath)
+		return errors.WithStack(err)
+	}
+
+	if err := dst.Close(); err != nil {
+		client.Remove(tempPath)
+		return errors.WithStack(err)
+	}
+
+	if err := client.Rename(tempPath, filename); err != nil {
+		client.Remove(tempPath)
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
 type FileCopy struct {
 	destPath   string
 	sourcePath string
@@ -50,53 +96,13 @@ func (t *FileCopy) DestPath() string {
 	return t.destPath
 }
 
-func (t *FileCopy) openTemp(client *sftp.Client) (string, *sftp.File, error) {
-	// FIXME perms
-	err := client.MkdirAll(filepath.Dir(t.destPath), 0o755)
-	if err != nil {
-		return "", nil, errors.WithStack(err)
-	}
-	for i := range 10 {
-		name := fmt.Sprintf("%s.pets.%d", t.destPath, i)
-		f, err := client.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_EXCL, t.perms)
-		if err == nil {
-			return name, f, nil
-		}
-	}
-	return "", nil, errors.Errorf("giving up creating temp file after 10 tries for %q", t.destPath)
-}
-
 func (t *FileCopy) Run(client *sftp.Client) error {
-	tempPath, dst, err := t.openTemp(client)
-	if err != nil {
-		return err
-	}
-
 	src, err := os.Open(t.sourcePath)
 	if err != nil {
-		dst.Close()
-		client.Remove(tempPath)
 		return errors.WithStack(err)
 	}
 	defer src.Close()
-
-	if _, err := io.Copy(dst, src); err != nil {
-		dst.Close()
-		client.Remove(tempPath)
-		return errors.WithStack(err)
-	}
-
-	if err := dst.Close(); err != nil {
-		client.Remove(tempPath)
-		return errors.WithStack(err)
-	}
-
-	if err := client.Rename(tempPath, t.destPath); err != nil {
-		client.Remove(tempPath)
-		return errors.WithStack(err)
-	}
-
-	return nil
+	return atomicallyReplace(client, t.destPath, t.perms, src)
 }
 
 func (t *FileCopy) IsDiff(client *sftp.Client) (bool, error) {
@@ -365,25 +371,9 @@ func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
 	}
 
 	// FIXME only update if changed
-	// FIXME atomically write like FileCopy
-	archdiffDir := filepath.Join(a.Root, "/etc/archdiff/ignore")
-	if err := sftpClient.MkdirAll(archdiffDir, 0o755); err != nil {
-		return errors.WithStack(err)
-	}
-	petsFileName := filepath.Join(archdiffDir, "pets")
-	fmt.Fprintln(&ignore, petsFileName)
-	petsFile, err := sftpClient.Create(petsFileName)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if _, err := io.Copy(petsFile, &ignore); err != nil {
-		petsFile.Close()
-		return errors.WithStack(err)
-	}
-	if err := petsFile.Close(); err != nil {
-		return errors.WithStack(err)
-	}
-	return nil
+	petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/ignore/pets")
+	fmt.Fprintln(&ignore, petsIgnoreFilename)
+	return atomicallyReplace(sftpClient, petsIgnoreFilename, 0o644, &ignore)
 }
 
 func (a *App) CmdDiff(ctx context.Context, s System, stdout io.Writer) error {
