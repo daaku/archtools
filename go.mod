@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/Jguer/go-alpm/v2 v2.2.2
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/daaku/prefixer v1.1.0
 	github.com/gobwas/glob v0.2.3
 	github.com/hashicorp/go-set v0.1.14

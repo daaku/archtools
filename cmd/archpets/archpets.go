@@ -18,16 +18,67 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/daaku/prefixer"
 	"github.com/jpillora/opts"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pkg/errors"
 	"github.com/pkg/sftp/v2"
+	sshfx "github.com/pkg/sftp/v2/encoding/ssh/filexfer"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
 
 var currentUser, _ = user.Current()
+
+type FileMeta struct {
+	UID  uint32      `toml:"uid"`
+	GID  uint32      `toml:"gid"`
+	Mode fs.FileMode `toml:"mode"`
+}
+
+func (m *FileMeta) diffOwner(stat fs.FileInfo) (bool, error) {
+	attr, ok := stat.Sys().(*sshfx.Attributes)
+	if !ok {
+		return false, errors.Errorf("expected syscall.Stat_t, but got %T for %s", stat.Sys(), stat.Name())
+	}
+	return attr.UID != m.UID || attr.GID != m.GID, nil
+}
+
+func (m *FileMeta) diffAll(stat fs.FileInfo) (bool, error) {
+	diff, err := m.diffOwner(stat)
+	if err != nil {
+		return false, err
+	}
+	return diff || stat.Mode() != m.Mode, nil
+}
+
+type SourceConfig struct {
+	Files map[string]FileMeta `toml:"files"`
+}
+
+func (c *SourceConfig) FileMeta(filename string, dir bool) (FileMeta, error) {
+	mode := fs.FileMode(0o644)
+	if dir {
+		mode = 0o755
+	}
+	for pattern, meta := range c.Files {
+		match, err := doublestar.Match(pattern, filename)
+		if err != nil {
+			return FileMeta{}, errors.WithStack(err)
+		}
+		if match {
+			println(pattern, filename)
+			fmt.Printf("%#v\n", meta)
+			if meta.Mode == 0 {
+				meta.Mode = mode
+			}
+			return meta, nil
+		}
+	}
+	// defaults
+	return FileMeta{Mode: mode}, nil
+}
 
 type File interface {
 	String() string
@@ -39,18 +90,13 @@ type File interface {
 func atomicallyReplace(
 	client *sftp.Client,
 	filename string,
-	mode fs.FileMode,
+	meta FileMeta,
 	src io.Reader,
 ) error {
 	open := func() (string, *sftp.File, error) {
-		// FIXME perms
-		err := client.MkdirAll(filepath.Dir(filename), 0o755)
-		if err != nil {
-			return "", nil, errors.WithStack(err)
-		}
 		for i := range 10 {
 			name := fmt.Sprintf("%s.pets.%d", filename, i)
-			f, err := client.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_EXCL, mode)
+			f, err := client.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_EXCL, meta.Mode)
 			if err == nil {
 				return name, f, nil
 			}
@@ -61,6 +107,12 @@ func atomicallyReplace(
 	tempPath, dst, err := open()
 	if err != nil {
 		return err
+	}
+
+	if err := client.Chown(tempPath, int(meta.UID), int(meta.GID)); err != nil {
+		dst.Close()
+		client.Remove(tempPath)
+		return errors.WithStack(err)
 	}
 
 	if _, err := io.Copy(dst, src); err != nil {
@@ -82,10 +134,62 @@ func atomicallyReplace(
 	return nil
 }
 
+type FileMkdir struct {
+	destPath string
+	meta     FileMeta
+}
+
+func (t *FileMkdir) String() string {
+	return fmt.Sprintf("M %s", t.destPath)
+}
+
+func (t *FileMkdir) DestPath() string {
+	return t.destPath
+}
+
+func (t *FileMkdir) Run(client *sftp.Client) error {
+	stat, err := client.Stat(t.destPath)
+	if err != nil {
+		if !serrors.Is(err, fs.ErrNotExist) {
+			return errors.WithStack(err)
+		}
+		if err := client.Mkdir(t.destPath, t.meta.Mode); err != nil {
+			return errors.WithStack(err)
+		}
+	} else {
+		if !stat.IsDir() {
+			return errors.Errorf("unable to replace non-directory with directory: %s", t.destPath)
+		}
+		if stat.Mode() != t.meta.Mode {
+			if err := client.Chmod(t.destPath, t.meta.Mode); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+	}
+	if err := client.Chown(t.destPath, int(t.meta.UID), int(t.meta.GID)); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (t *FileMkdir) IsDiff(client *sftp.Client) (bool, error) {
+	stat, err := client.Stat(t.destPath)
+	if err != nil {
+		if serrors.Is(err, fs.ErrNotExist) {
+			return true, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	if !stat.IsDir() {
+		return false, errors.Errorf("unable to replace file with directory: %s", t.destPath)
+	}
+	return t.meta.diffAll(stat)
+}
+
 type FileCopy struct {
 	destPath   string
 	sourcePath string
-	perms      fs.FileMode
+	meta       FileMeta
 }
 
 func (t *FileCopy) String() string {
@@ -102,7 +206,7 @@ func (t *FileCopy) Run(client *sftp.Client) error {
 		return errors.WithStack(err)
 	}
 	defer src.Close()
-	return atomicallyReplace(client, t.destPath, t.perms, src)
+	return atomicallyReplace(client, t.destPath, t.meta, src)
 }
 
 func (t *FileCopy) IsDiff(client *sftp.Client) (bool, error) {
@@ -118,7 +222,11 @@ func (t *FileCopy) IsDiff(client *sftp.Client) (bool, error) {
 		}
 		return false, errors.WithStack(err)
 	}
-	if dstStat.Mode() != t.perms {
+	diff, err := t.meta.diffAll(dstStat)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if diff {
 		return true, nil
 	}
 
@@ -138,6 +246,7 @@ func (t *FileCopy) IsDiff(client *sftp.Client) (bool, error) {
 type FileSymlink struct {
 	destPath   string
 	targetPath string
+	meta       FileMeta
 }
 
 func (t *FileSymlink) String() string {
@@ -159,6 +268,13 @@ func (t *FileSymlink) IsDiff(client *sftp.Client) (bool, error) {
 	if lstat.Mode().IsDir() || lstat.Mode().IsRegular() {
 		return true, nil
 	}
+	diff, err := t.meta.diffOwner(lstat)
+	if err != nil {
+		return true, errors.WithStack(err)
+	}
+	if diff {
+		return true, nil
+	}
 	current, err := client.ReadLink(t.destPath)
 	if err != nil {
 		if serrors.Is(err, fs.ErrNotExist) {
@@ -171,23 +287,13 @@ func (t *FileSymlink) IsDiff(client *sftp.Client) (bool, error) {
 
 func (t *FileSymlink) Run(client *sftp.Client) error {
 	client.Remove(t.destPath) // ignore error
-	// FIXME perms
-	err := client.MkdirAll(filepath.Dir(t.destPath), 0o755)
-	if err != nil {
-		return errors.WithStack(err)
-	}
 	if err := client.Symlink(t.targetPath, t.destPath); err != nil {
 		return errors.WithStack(err)
 	}
+	if err := client.Chown(t.targetPath, int(t.meta.UID), int(t.meta.GID)); err != nil {
+		return errors.WithStack(err)
+	}
 	return nil
-}
-
-type System struct {
-	Name   string
-	Source string
-	Host   string `toml:"host"`
-	Port   int    `toml:"port"`
-	Root   string
 }
 
 type mutSlice[T any] struct {
@@ -198,12 +304,40 @@ func (m *mutSlice[T]) append(t T) {
 	m.s = append(m.s, t)
 }
 
+type System struct {
+	Name         string
+	Source       string
+	Host         string `toml:"host"`
+	Port         int    `toml:"port"`
+	Root         string
+	SourceConfig *SourceConfig
+}
+
+func (s *System) FileMeta(destPath string, dir bool) (FileMeta, error) {
+	relPath, err := filepath.Rel(s.Root+"/", destPath)
+	if err != nil {
+		return FileMeta{}, errors.WithStack(err)
+	}
+	return s.SourceConfig.FileMeta(relPath, dir)
+}
+
 func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.DirEntry, err error) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if d.IsDir() { // continue on directories
-		// FIXME: handle empty directories?
+
+	meta, err := s.FileMeta(destPath, d.IsDir())
+	if err != nil {
+		return err
+	}
+
+	if d.IsDir() {
+		if destPath != "/" {
+			files.append(&FileMkdir{
+				destPath: destPath,
+				meta:     meta,
+			})
+		}
 		return nil
 	}
 
@@ -218,6 +352,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 			files.append(&FileSymlink{
 				destPath:   destPath,
 				targetPath: target,
+				meta:       meta,
 			})
 			return nil
 		}
@@ -229,6 +364,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 			files.append(&FileSymlink{
 				destPath:   destPath,
 				targetPath: target,
+				meta:       meta,
 			})
 			return nil
 		}
@@ -261,7 +397,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 		files.append(&FileCopy{
 			sourcePath: absTarget,
 			destPath:   destPath,
-			perms:      0o644, // FIXME
+			meta:       meta,
 		})
 
 		return nil
@@ -271,7 +407,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 	files.append(&FileCopy{
 		sourcePath: path,
 		destPath:   destPath,
-		perms:      0o644, // FIXME
+		meta:       meta,
 	})
 	return nil
 }
@@ -305,6 +441,35 @@ type App struct {
 	Cmd    string   `opts:"mode=arg"`
 	Names  []string `opts:"mode=arg,help=No names implies all systems."`
 	DryRun bool     `opts:"name=dry-run,short=n,help=dry run mode"`
+
+	SourceConfig SourceConfig `opts:"-"`
+}
+
+func (a *App) Init(ctx context.Context) error {
+	if len(a.Names) == 0 {
+		var err error
+		a.Names, err = a.Discover()
+		if err != nil {
+			return err
+		}
+	}
+
+	configPath := filepath.Join(a.Repo, "pets.toml")
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		if !serrors.Is(err, fs.ErrNotExist) {
+			return errors.Errorf("error reading config %q: %v", configPath, err)
+		}
+	} else {
+		err = toml.NewDecoder(bytes.NewReader(configBytes)).
+			DisallowUnknownFields().
+			Decode(&a.SourceConfig)
+		if err != nil {
+			return errors.Errorf("error decoding config %q: %v", configPath, err)
+		}
+	}
+
+	return nil
 }
 
 func (a *App) Named(systemName string) (System, error) {
@@ -315,9 +480,10 @@ func (a *App) Named(systemName string) (System, error) {
 		return System{}, errors.Errorf("error reading config %q: %v", configPath, err)
 	}
 	s := System{
-		Name: systemName,
-		Root: a.Root,
-		Port: 22,
+		Name:         systemName,
+		Root:         a.Root,
+		Port:         22,
+		SourceConfig: &a.SourceConfig,
 	}
 	err = toml.NewDecoder(bytes.NewReader(configBytes)).
 		DisallowUnknownFields().
@@ -393,7 +559,8 @@ func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
 	// FIXME only update if changed
 	petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/ignore/pets")
 	fmt.Fprintln(&ignore, petsIgnoreFilename)
-	return atomicallyReplace(sftpClient, petsIgnoreFilename, 0o644, &ignore)
+	petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
+	return atomicallyReplace(sftpClient, petsIgnoreFilename, petsMeta, &ignore)
 }
 
 func (a *App) CmdDiff(ctx context.Context, s System, stdout io.Writer) error {
@@ -438,8 +605,6 @@ func getSSHAuthMethods() []ssh.AuthMethod {
 
 func connectToHost(s System) (*ssh.Client, error) {
 	config := &ssh.ClientConfig{
-		// FIXME: make user optional for safer testing
-		// User:            currentUser.Username,
 		User:            "root",
 		Auth:            getSSHAuthMethods(),
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -474,12 +639,8 @@ func run(ctx context.Context) error {
 		return errors.Errorf("unknown command: %s", a.Cmd)
 	}
 
-	if len(a.Names) == 0 {
-		var err error
-		a.Names, err = a.Discover()
-		if err != nil {
-			return err
-		}
+	if err := a.Init(ctx); err != nil {
+		return err
 	}
 
 	var outMu sync.Mutex
