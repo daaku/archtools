@@ -149,6 +149,16 @@ func (t *FileSymlink) DestPath() string {
 }
 
 func (t *FileSymlink) IsDiff(client *sftp.Client) (bool, error) {
+	lstat, err := client.LStat(t.destPath)
+	if err != nil {
+		if serrors.Is(err, fs.ErrNotExist) {
+			return true, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	if lstat.Mode().IsDir() || lstat.Mode().IsRegular() {
+		return true, nil
+	}
 	current, err := client.ReadLink(t.destPath)
 	if err != nil {
 		if serrors.Is(err, fs.ErrNotExist) {
