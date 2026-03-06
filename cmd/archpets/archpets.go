@@ -40,7 +40,7 @@ type FileMeta struct {
 func (m *FileMeta) diffOwner(stat fs.FileInfo) (bool, error) {
 	attr, ok := stat.Sys().(*sshfx.Attributes)
 	if !ok {
-		return false, errors.Errorf("expected syscall.Stat_t, but got %T for %s", stat.Sys(), stat.Name())
+		return false, errors.Errorf("expected %T, but got %T for %s", attr, stat.Sys(), stat.Name())
 	}
 	return attr.UID != m.UID || attr.GID != m.GID, nil
 }
@@ -50,7 +50,7 @@ func (m *FileMeta) diffAll(stat fs.FileInfo) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return diff || stat.Mode() != m.Mode, nil
+	return diff || stat.Mode().Perm() != m.Mode, nil
 }
 
 type SourceConfig struct {
