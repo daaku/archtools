@@ -517,7 +517,7 @@ func (a *App) CmdLs(ctx context.Context, s System, stdout io.Writer) error {
 	return nil
 }
 
-func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
+func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryRun bool) error {
 	client, err := connectToHost(s)
 	if err != nil {
 		return err
@@ -549,20 +549,32 @@ func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
 			continue
 		}
 		fmt.Fprintf(stdout, "changed: %s\n", f.String())
-		if err := f.Run(sftpClient); err != nil {
+		if !dryRun {
+			if err := f.Run(sftpClient); err != nil {
+				return err
+			}
+		}
+	}
+
+	if !dryRun {
+		// FIXME only update if changed
+		petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/ignore/pets")
+		fmt.Fprintln(&ignore, petsIgnoreFilename)
+		petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
+		if err := atomicallyReplace(sftpClient, petsIgnoreFilename, petsMeta, &ignore); err != nil {
 			return err
 		}
 	}
 
-	// FIXME only update if changed
-	petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/ignore/pets")
-	fmt.Fprintln(&ignore, petsIgnoreFilename)
-	petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
-	return atomicallyReplace(sftpClient, petsIgnoreFilename, petsMeta, &ignore)
+	return nil
+}
+
+func (a *App) CmdDeploy(ctx context.Context, s System, stdout io.Writer) error {
+	return a.diffOrDeploy(ctx, s, stdout, false)
 }
 
 func (a *App) CmdDiff(ctx context.Context, s System, stdout io.Writer) error {
-	return nil
+	return a.diffOrDeploy(ctx, s, stdout, true)
 }
 
 func getDefaultSigners() ([]ssh.Signer, error) {
