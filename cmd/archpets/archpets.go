@@ -126,7 +126,7 @@ type File interface {
 
 func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (bool, error) {
 	var destMeta FileMeta
-	destStat, err := client.Stat(f.DestPath())
+	destStat, err := client.LStat(f.DestPath())
 	if err != nil {
 		if !serrors.Is(err, fs.ErrNotExist) {
 			return false, errors.WithStack(err)
