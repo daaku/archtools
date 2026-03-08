@@ -33,6 +33,22 @@ import (
 
 var currentUser, _ = user.Current()
 
+type didDiffWriter struct {
+	io.Writer
+	newlines int
+}
+
+var newline = []byte("\n")
+
+func (d *didDiffWriter) Write(b []byte) (int, error) {
+	d.newlines += bytes.Count(b, newline)
+	return d.Writer.Write(b)
+}
+
+func (d *didDiffWriter) isDiff() bool {
+	return d.newlines > 2
+}
+
 type FileMeta struct {
 	UID  uint32      `toml:"uid"`
 	GID  uint32      `toml:"gid"`
@@ -59,39 +75,39 @@ func FileMetaFromStat(stat fs.FileInfo) (FileMeta, error) {
 	}, nil
 }
 
-func (m *FileMeta) diffOwner(stat fs.FileInfo) (bool, error) {
-	attr, ok := stat.Sys().(*sshfx.Attributes)
-	if !ok {
-		return false, errors.Errorf("expected %T, but got %T for %s", attr, stat.Sys(), stat.Name())
-	}
-	return attr.UID != m.UID || attr.GID != m.GID, nil
-}
-
-func (m *FileMeta) diffAll(stat fs.FileInfo) (bool, error) {
-	diff, err := m.diffOwner(stat)
-	if err != nil {
-		return false, err
-	}
-	return diff || stat.Mode().Perm() != m.Mode, nil
-}
-
 type SourceConfig struct {
 	Files map[string]FileMeta `toml:"files"`
 }
 
-func (c *SourceConfig) FileMeta(filename string, dir bool) (FileMeta, error) {
+func (c *SourceConfig) FileMeta(relDestPath, sourcePath string, dir bool) (FileMeta, error) {
 	mode := fs.FileMode(0o644)
 	if dir {
 		mode = 0o755
+	} else {
+		// maintain executable bit if set in filesystem
+		stat, err := os.Stat(sourcePath)
+		if err != nil {
+			return FileMeta{}, errors.WithStack(err)
+		}
+		if stat.Mode()&0o111 != 0 {
+			mode = 0o755
+		}
 	}
 	for pattern, meta := range c.Files {
-		match, err := doublestar.Match(pattern, filename)
+		match, err := doublestar.Match(pattern, relDestPath)
 		if err != nil {
 			return FileMeta{}, errors.WithStack(err)
 		}
 		if match {
 			if meta.Mode == 0 {
 				meta.Mode = mode
+			} else if dir {
+				// for any read bits set, also set the execute bit
+				for _, readBit := range []fs.FileMode{0o400, 0o040, 0o004} {
+					if meta.Mode&readBit != 0 {
+						meta.Mode |= readBit >> 2 // shift read bit to execute bit for that group
+					}
+				}
 			}
 			return meta, nil
 		}
@@ -103,8 +119,78 @@ func (c *SourceConfig) FileMeta(filename string, dir bool) (FileMeta, error) {
 type File interface {
 	String() string
 	DestPath() string
+	SourcePath() string
+	DesiredMeta() FileMeta
 	Run(client *sftp.Client) error
-	IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error)
+}
+
+func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (bool, error) {
+	var destMeta FileMeta
+	destStat, err := client.Stat(f.DestPath())
+	if err != nil {
+		if !serrors.Is(err, fs.ErrNotExist) {
+			return false, errors.WithStack(err)
+		}
+	} else {
+		destMeta, err = FileMetaFromStat(destStat)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+	}
+	desiredMeta := f.DesiredMeta()
+
+	var destMetaBuf, desiredMetaBuf bytes.Buffer
+	switch f := f.(type) {
+	default:
+		return false, errors.Errorf("unknown File type: %T", f)
+	case *FileCopy:
+		fmt.Fprintln(&destMetaBuf, destMeta.allString())
+		fmt.Fprintln(&desiredMetaBuf, desiredMeta.allString())
+
+		destReader, err := client.Open(f.DestPath())
+		if err != nil {
+			if !serrors.Is(err, fs.ErrNotExist) {
+				return false, errors.WithStack(err)
+			}
+		} else {
+			if _, err := io.Copy(&destMetaBuf, destReader); err != nil {
+				return false, errors.WithStack(err)
+			}
+		}
+
+		desiredReader, err := client.Open(f.sourcePath)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if _, err := io.Copy(&desiredMetaBuf, desiredReader); err != nil {
+			return false, errors.WithStack(err)
+		}
+	case *FileMkdir:
+		fmt.Fprintln(&destMetaBuf, destMeta.allString())
+		fmt.Fprintln(&desiredMetaBuf, desiredMeta.allString())
+	case *FileSymlink:
+		fmt.Fprintln(&destMetaBuf, destMeta.ownerString())
+		fmt.Fprintln(&desiredMetaBuf, desiredMeta.ownerString())
+
+		if !destStat.IsDir() && !destStat.Mode().IsRegular() {
+			currentLink, err := client.ReadLink(f.destPath)
+			if err != nil {
+				if !serrors.Is(err, fs.ErrNotExist) {
+					return false, errors.WithStack(err)
+				}
+			}
+			fmt.Fprintln(&destMetaBuf, currentLink)
+		}
+
+		fmt.Fprintln(&desiredMetaBuf, f.targetPath)
+	}
+
+	writer := didDiffWriter{Writer: out}
+	err = diff.Text(f.DestPath(), f.SourcePath(), destMetaBuf.Bytes(), desiredMetaBuf.Bytes(), &writer, options...)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return writer.isDiff(), nil
 }
 
 func atomicallyReplace(
@@ -155,8 +241,9 @@ func atomicallyReplace(
 }
 
 type FileMkdir struct {
-	destPath string
-	meta     FileMeta
+	sourcePath string
+	destPath   string
+	meta       FileMeta
 }
 
 func (t *FileMkdir) String() string {
@@ -165,6 +252,14 @@ func (t *FileMkdir) String() string {
 
 func (t *FileMkdir) DestPath() string {
 	return t.destPath
+}
+
+func (t *FileMkdir) SourcePath() string {
+	return t.sourcePath
+}
+
+func (t *FileMkdir) DesiredMeta() FileMeta {
+	return t.meta
 }
 
 func (t *FileMkdir) Run(client *sftp.Client) error {
@@ -180,8 +275,8 @@ func (t *FileMkdir) Run(client *sftp.Client) error {
 		if !stat.IsDir() {
 			return errors.Errorf("unable to replace non-directory with directory: %s", t.destPath)
 		}
-		if stat.Mode() != t.meta.Mode {
-			if err := client.Chmod(t.destPath, t.meta.Mode); err != nil {
+		if stat.Mode().Perm() != t.meta.Mode.Perm() {
+			if err := client.Chmod(t.destPath, t.meta.Mode.Perm()); err != nil {
 				return errors.WithStack(err)
 			}
 		}
@@ -190,28 +285,6 @@ func (t *FileMkdir) Run(client *sftp.Client) error {
 		return errors.WithStack(err)
 	}
 	return nil
-}
-
-func (t *FileMkdir) IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error) {
-	stat, err := client.Stat(t.destPath)
-	if err != nil {
-		if serrors.Is(err, fs.ErrNotExist) {
-			return true, nil
-		}
-		return false, errors.WithStack(err)
-	}
-	if !stat.IsDir() {
-		return false, errors.Errorf("unable to replace file with directory: %s", t.destPath)
-	}
-	currentMeta, err := FileMetaFromStat(stat)
-	if err != nil {
-		return false, err
-	}
-	err = diff.Text(t.destPath, t.destPath, t.meta.allString(), currentMeta.allString(), out, options...)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-	return t.meta.diffAll(stat)
 }
 
 type FileCopy struct {
@@ -228,6 +301,14 @@ func (t *FileCopy) DestPath() string {
 	return t.destPath
 }
 
+func (t *FileCopy) SourcePath() string {
+	return t.sourcePath
+}
+
+func (t *FileCopy) DesiredMeta() FileMeta {
+	return t.meta
+}
+
 func (t *FileCopy) Run(client *sftp.Client) error {
 	src, err := os.Open(t.sourcePath)
 	if err != nil {
@@ -237,41 +318,8 @@ func (t *FileCopy) Run(client *sftp.Client) error {
 	return atomicallyReplace(client, t.destPath, t.meta, src)
 }
 
-func (t *FileCopy) IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error) {
-	src, err := os.ReadFile(t.sourcePath)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-
-	dstStat, err := client.Stat(t.destPath)
-	if err != nil {
-		if serrors.Is(err, fs.ErrNotExist) {
-			return true, nil
-		}
-		return false, errors.WithStack(err)
-	}
-	diff, err := t.meta.diffAll(dstStat)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-	if diff {
-		return true, nil
-	}
-
-	dstF, err := client.Open(t.destPath)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-
-	dst, err := io.ReadAll(dstF)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-
-	return !bytes.Equal(src, dst), nil
-}
-
 type FileSymlink struct {
+	sourcePath string
 	destPath   string
 	targetPath string
 	meta       FileMeta
@@ -285,32 +333,12 @@ func (t *FileSymlink) DestPath() string {
 	return t.destPath
 }
 
-func (t *FileSymlink) IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error) {
-	lstat, err := client.LStat(t.destPath)
-	if err != nil {
-		if serrors.Is(err, fs.ErrNotExist) {
-			return true, nil
-		}
-		return false, errors.WithStack(err)
-	}
-	if lstat.Mode().IsDir() || lstat.Mode().IsRegular() {
-		return true, nil
-	}
-	diff, err := t.meta.diffOwner(lstat)
-	if err != nil {
-		return true, errors.WithStack(err)
-	}
-	if diff {
-		return true, nil
-	}
-	current, err := client.ReadLink(t.destPath)
-	if err != nil {
-		if serrors.Is(err, fs.ErrNotExist) {
-			return true, nil
-		}
-		return false, errors.WithStack(err)
-	}
-	return current != t.targetPath, nil
+func (t *FileSymlink) SourcePath() string {
+	return t.sourcePath
+}
+
+func (t *FileSymlink) DesiredMeta() FileMeta {
+	return t.meta
 }
 
 func (t *FileSymlink) Run(client *sftp.Client) error {
@@ -341,12 +369,12 @@ type System struct {
 	SourceConfig *SourceConfig
 }
 
-func (s *System) FileMeta(destPath string, dir bool) (FileMeta, error) {
+func (s *System) FileMeta(destPath, sourcePath string, dir bool) (FileMeta, error) {
 	relPath, err := filepath.Rel(s.Root+"/", destPath)
 	if err != nil {
 		return FileMeta{}, errors.WithStack(err)
 	}
-	return s.SourceConfig.FileMeta(relPath, dir)
+	return s.SourceConfig.FileMeta(relPath, sourcePath, dir)
 }
 
 func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.DirEntry, err error) error {
@@ -354,7 +382,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 		return errors.WithStack(err)
 	}
 
-	meta, err := s.FileMeta(destPath, d.IsDir())
+	meta, err := s.FileMeta(destPath, path, d.IsDir())
 	if err != nil {
 		return err
 	}
@@ -362,8 +390,9 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 	if d.IsDir() {
 		if destPath != "/" {
 			files.append(&FileMkdir{
-				destPath: destPath,
-				meta:     meta,
+				sourcePath: path,
+				destPath:   destPath,
+				meta:       meta,
 			})
 		}
 		return nil
@@ -378,6 +407,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 		// abs path symlink, keep it
 		if filepath.IsAbs(target) {
 			files.append(&FileSymlink{
+				sourcePath: path,
 				destPath:   destPath,
 				targetPath: target,
 				meta:       meta,
@@ -390,6 +420,7 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 		// in-tree symlink, keep it
 		if strings.HasPrefix(cleanTarget, s.Source) {
 			files.append(&FileSymlink{
+				sourcePath: path,
 				destPath:   destPath,
 				targetPath: target,
 				meta:       meta,
@@ -580,7 +611,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 		}
 		fmt.Fprintln(&ignore, ignorePath)
 
-		diff, err := f.IsDiff(sftpClient, diffOut, diffOptions...)
+		diff, err := Diff(sftpClient, f, diffOut, diffOptions...)
 		if err != nil {
 			return err
 		}
