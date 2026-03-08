@@ -22,6 +22,20 @@ well for a very long time and I still enjoy it.
 1. How do you bootstrap a new system?
 1. How do you migrate an existing system to use this?
 
+1. What is normal usage?
+
+```bash
+archpets diff [system]
+archpets deploy [system]
+archdiff
+archdest
+
+systemctl preset-all
+
+# as user
+systemctl --user preset-all
+```
+
 ## archdiff
 
 ArchDiff provides a way to see a "diff" for your entire [Arch
