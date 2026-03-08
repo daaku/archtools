@@ -434,11 +434,12 @@ func (s *System) Files() ([]File, error) {
 }
 
 type App struct {
-	Repo   string   `opts:"name=repo,short=g,env=PETS_REPO,help=repo of systems"`
-	Root   string   `opts:"name=root,short=r,help=alternate root directory"`
-	Cmd    string   `opts:"mode=arg"`
-	Names  []string `opts:"mode=arg,help=No names implies all systems."`
-	DryRun bool     `opts:"name=dry-run,short=n,help=dry run mode"`
+	Repo    string   `opts:"name=repo,short=g,env=PETS_REPO,help=repo of systems"`
+	Root    string   `opts:"name=root,short=r,help=alternate root directory"`
+	Cmd     string   `opts:"mode=arg"`
+	Names   []string `opts:"mode=arg,help=No names implies all systems."`
+	Verbose bool     `opts:"name=verbose,short=v,help=verbose output"`
+	DryRun  bool     `opts:"name=dry-run,short=n,help=dry run mode"`
 
 	SourceConfig SourceConfig `opts:"-"`
 }
@@ -545,7 +546,9 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 			return err
 		}
 		if !diff {
-			fmt.Fprintf(stdout, "unchanged: %s\n", f.String())
+			if a.Verbose {
+				fmt.Fprintf(stdout, "unchanged: %s\n", f.String())
+			}
 			continue
 		}
 		fmt.Fprintf(stdout, "changed: %s\n", f.String())
@@ -582,6 +585,7 @@ func getDefaultSigners() ([]ssh.Signer, error) {
 		filepath.Join(currentUser.HomeDir, ".ssh", "id_ed25519"),
 		filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa"),
 		filepath.Join(currentUser.HomeDir, ".ssh", "id_ecdsa"),
+		// FIXME: custom identity file option
 		filepath.Join(currentUser.HomeDir, ".ssh", "aws_ap_south_1_rsa"),
 	}
 	var signers []ssh.Signer
