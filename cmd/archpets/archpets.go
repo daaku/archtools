@@ -22,6 +22,8 @@ import (
 	"github.com/daaku/prefixer"
 	"github.com/jpillora/opts"
 	"github.com/pelletier/go-toml/v2"
+	"github.com/pkg/diff"
+	"github.com/pkg/diff/write"
 	"github.com/pkg/errors"
 	"github.com/pkg/sftp/v2"
 	sshfx "github.com/pkg/sftp/v2/encoding/ssh/filexfer"
@@ -35,6 +37,26 @@ type FileMeta struct {
 	UID  uint32      `toml:"uid"`
 	GID  uint32      `toml:"gid"`
 	Mode fs.FileMode `toml:"mode"`
+}
+
+func (m *FileMeta) ownerString() string {
+	return fmt.Sprintf("%d:%d", m.UID, m.GID)
+}
+
+func (m *FileMeta) allString() string {
+	return fmt.Sprintf("%d:%d %s", m.UID, m.GID, m.Mode)
+}
+
+func FileMetaFromStat(stat fs.FileInfo) (FileMeta, error) {
+	attr, ok := stat.Sys().(*sshfx.Attributes)
+	if !ok {
+		return FileMeta{}, errors.Errorf("expected %T, but got %T for %s", attr, stat.Sys(), stat.Name())
+	}
+	return FileMeta{
+		UID:  attr.UID,
+		GID:  attr.GID,
+		Mode: stat.Mode().Perm(),
+	}, nil
 }
 
 func (m *FileMeta) diffOwner(stat fs.FileInfo) (bool, error) {
@@ -82,7 +104,7 @@ type File interface {
 	String() string
 	DestPath() string
 	Run(client *sftp.Client) error
-	IsDiff(client *sftp.Client) (bool, error)
+	IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error)
 }
 
 func atomicallyReplace(
@@ -170,7 +192,7 @@ func (t *FileMkdir) Run(client *sftp.Client) error {
 	return nil
 }
 
-func (t *FileMkdir) IsDiff(client *sftp.Client) (bool, error) {
+func (t *FileMkdir) IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error) {
 	stat, err := client.Stat(t.destPath)
 	if err != nil {
 		if serrors.Is(err, fs.ErrNotExist) {
@@ -180,6 +202,14 @@ func (t *FileMkdir) IsDiff(client *sftp.Client) (bool, error) {
 	}
 	if !stat.IsDir() {
 		return false, errors.Errorf("unable to replace file with directory: %s", t.destPath)
+	}
+	currentMeta, err := FileMetaFromStat(stat)
+	if err != nil {
+		return false, err
+	}
+	err = diff.Text(t.destPath, t.destPath, t.meta.allString(), currentMeta.allString(), out, options...)
+	if err != nil {
+		return false, errors.WithStack(err)
 	}
 	return t.meta.diffAll(stat)
 }
@@ -207,7 +237,7 @@ func (t *FileCopy) Run(client *sftp.Client) error {
 	return atomicallyReplace(client, t.destPath, t.meta, src)
 }
 
-func (t *FileCopy) IsDiff(client *sftp.Client) (bool, error) {
+func (t *FileCopy) IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error) {
 	src, err := os.ReadFile(t.sourcePath)
 	if err != nil {
 		return false, errors.WithStack(err)
@@ -255,7 +285,7 @@ func (t *FileSymlink) DestPath() string {
 	return t.destPath
 }
 
-func (t *FileSymlink) IsDiff(client *sftp.Client) (bool, error) {
+func (t *FileSymlink) IsDiff(client *sftp.Client, out io.Writer, options ...write.Option) (bool, error) {
 	lstat, err := client.LStat(t.destPath)
 	if err != nil {
 		if serrors.Is(err, fs.ErrNotExist) {
@@ -439,6 +469,7 @@ type App struct {
 	Cmd     string   `opts:"mode=arg"`
 	Names   []string `opts:"mode=arg,help=No names implies all systems."`
 	Verbose bool     `opts:"name=verbose,short=v,help=verbose output"`
+	Color   bool     `opts:"name=color,help=colorized output"`
 	DryRun  bool     `opts:"name=dry-run,short=n,help=dry run mode"`
 
 	SourceConfig SourceConfig `opts:"-"`
@@ -533,6 +564,14 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 	if err != nil {
 		return err
 	}
+	diffOut := io.Discard
+	if dryRun && a.Verbose {
+		diffOut = stdout
+	}
+	var diffOptions []write.Option
+	if a.Color {
+		diffOptions = append(diffOptions, write.TerminalColor())
+	}
 	var ignore bytes.Buffer
 	for _, f := range files {
 		ignorePath := f.DestPath()
@@ -541,7 +580,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 		}
 		fmt.Fprintln(&ignore, ignorePath)
 
-		diff, err := f.IsDiff(sftpClient)
+		diff, err := f.IsDiff(sftpClient, diffOut, diffOptions...)
 		if err != nil {
 			return err
 		}
@@ -643,8 +682,9 @@ var errSentinel = errors.New("sentinel error")
 
 func run(ctx context.Context) error {
 	a := App{
-		Root: "/",
-		Repo: "/home/naitik/workspace/pets",
+		Root:  "/",
+		Repo:  "/home/naitik/workspace/pets",
+		Color: true,
 	}
 	opts.Parse(&a)
 

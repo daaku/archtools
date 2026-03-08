@@ -11,6 +11,7 @@ require (
 	github.com/jpillora/opts v1.3.1
 	github.com/mattn/go-zglob v0.0.4
 	github.com/pelletier/go-toml/v2 v2.2.4
+	github.com/pkg/diff v0.0.0-20241224192749-4e6772a4315c
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/sftp/v2 v2.0.0-alpha
 	golang.org/x/crypto v0.48.0
