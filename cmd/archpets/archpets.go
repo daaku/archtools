@@ -172,7 +172,7 @@ func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (
 		fmt.Fprintln(&destMetaBuf, destMeta.ownerString())
 		fmt.Fprintln(&desiredMetaBuf, desiredMeta.ownerString())
 
-		if !destStat.IsDir() && !destStat.Mode().IsRegular() {
+		if destStat != nil && !destStat.IsDir() && !destStat.Mode().IsRegular() {
 			currentLink, err := client.ReadLink(f.destPath)
 			if err != nil {
 				if !serrors.Is(err, fs.ErrNotExist) {
@@ -344,9 +344,6 @@ func (t *FileSymlink) DesiredMeta() FileMeta {
 func (t *FileSymlink) Run(client *sftp.Client) error {
 	client.Remove(t.destPath) // ignore error
 	if err := client.Symlink(t.targetPath, t.destPath); err != nil {
-		return errors.WithStack(err)
-	}
-	if err := client.Chown(t.targetPath, int(t.meta.UID), int(t.meta.GID)); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
