@@ -158,7 +158,7 @@ func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (
 			}
 		}
 
-		desiredReader, err := client.Open(f.sourcePath)
+		desiredReader, err := os.Open(f.sourcePath)
 		if err != nil {
 			return false, errors.WithStack(err)
 		}
