@@ -1,6 +1,6 @@
 importpath=github.com/daaku/archtools
 pkgname=$(basename $importpath)
-pkgver=1
+pkgver=$(git rev-list --count HEAD)
 pkgrel=1
 pkgdesc='tools to manage archlinux systems'
 arch=(x86_64 armv6h armv7h)
