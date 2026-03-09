@@ -606,7 +606,11 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 		if a.Root != "/" {
 			ignorePath = strings.TrimPrefix(ignorePath, a.Root)
 		}
-		fmt.Fprintln(&ignore, ignorePath)
+
+		// dont ignore directories
+		if _, ok := f.(*FileMkdir); !ok {
+			fmt.Fprintln(&ignore, ignorePath)
+		}
 
 		diff, err := Diff(sftpClient, f, diffOut, diffOptions...)
 		if err != nil {
