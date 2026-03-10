@@ -633,7 +633,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 			}
 			continue
 		}
-		if a.Verbose {
+		if !diffMode || a.Verbose {
 			fmt.Fprintf(stdout, "changed: %s\n", f.String())
 		}
 		if !diffMode {
