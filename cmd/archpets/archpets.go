@@ -35,6 +35,7 @@ var currentUser, _ = user.Current()
 
 type didDiffWriter struct {
 	io.Writer
+	header   []byte
 	newlines int
 }
 
@@ -42,6 +43,16 @@ var newline = []byte("\n")
 
 func (d *didDiffWriter) Write(b []byte) (int, error) {
 	d.newlines += bytes.Count(b, newline)
+	if !d.isDiff() {
+		d.header = append(d.header, b...)
+		return len(b), nil
+	}
+	if len(d.header) > 0 {
+		if n, err := d.Write(d.header); err != nil {
+			return n, err
+		}
+		d.header = nil
+	}
 	return d.Writer.Write(b)
 }
 
@@ -577,7 +588,7 @@ func (a *App) CmdLs(ctx context.Context, s System, stdout io.Writer) error {
 	return nil
 }
 
-func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryRun bool) error {
+func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diffMode bool) error {
 	client, err := connectToHost(s)
 	if err != nil {
 		return err
@@ -593,7 +604,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 		return err
 	}
 	diffOut := io.Discard
-	if dryRun && a.Verbose {
+	if diffMode {
 		diffOut = stdout
 	}
 	var diffOptions []write.Option
@@ -622,15 +633,17 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, dryR
 			}
 			continue
 		}
-		fmt.Fprintf(stdout, "changed: %s\n", f.String())
-		if !dryRun {
+		if a.Verbose {
+			fmt.Fprintf(stdout, "changed: %s\n", f.String())
+		}
+		if !diffMode {
 			if err := f.Run(sftpClient); err != nil {
 				return err
 			}
 		}
 	}
 
-	if !dryRun {
+	if !diffMode {
 		// FIXME only update if changed
 		petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/ignore/pets")
 		fmt.Fprintln(&ignore, petsIgnoreFilename)
