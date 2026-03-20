@@ -54,16 +54,8 @@ ignoring modified config files.
 
 ### todo
 
-- local: status using sha256 only
-- local: diff with actual content
-
-- works locally
-- works over ssh
-- alternate root directory / chroot
-
+- uid/gid as string for dynamic lookup
 - pull changes to repo
-- system package manifest
-- dry run
 
 ### overlay fs
 

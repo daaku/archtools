@@ -229,7 +229,7 @@ func Main() error {
 	flag.StringVar(&app.Root, "root", "/", "set an alternate installation root")
 	flag.StringVar(
 		&app.DB, "dbpath", "/var/lib/pacman", "set an alternate database location")
-	flag.StringVar(&app.IgnoreDir, "ignore", "/etc/archdiff/ignore",
+	flag.StringVar(&app.IgnoreDir, "ignore", "/etc/archdiff",
 		"directory of ignore files")
 	flag.StringVar(&app.CPUProfile, "cpuprofile", "", "write cpu profile here")
 	flag.Parse()
