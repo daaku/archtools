@@ -645,7 +645,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 
 	if !diffMode {
 		// FIXME only update if changed
-		petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/ignore/pets")
+		petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/pets")
 		fmt.Fprintln(&ignore, petsIgnoreFilename)
 		petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
 		if err := atomicallyReplace(sftpClient, petsIgnoreFilename, petsMeta, &ignore); err != nil {
