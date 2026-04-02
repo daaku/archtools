@@ -56,10 +56,3 @@ ignoring modified config files.
 
 - uid/gid as string for dynamic lookup
 - pull changes to repo
-
-### overlay fs
-
-- real file: sync file
-- relative invalid symlink: error
-- relative valid symlink: sync target as file
-- absolute symlink: sync as symlink
