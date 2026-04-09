@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	serrors "errors"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,28 +63,36 @@ func (d *didDiffWriter) isDiff() bool {
 }
 
 type FileMeta struct {
-	UID  uint32      `toml:"uid"`
-	GID  uint32      `toml:"gid"`
-	Mode fs.FileMode `toml:"mode"`
+	User  string      `toml:"user"`
+	Group string      `toml:"group"`
+	Mode  fs.FileMode `toml:"mode"`
 }
 
 func (m *FileMeta) ownerString() string {
-	return fmt.Sprintf("%d:%d", m.UID, m.GID)
+	return fmt.Sprintf("%d:%d", m.User, m.Group)
 }
 
 func (m *FileMeta) allString() string {
-	return fmt.Sprintf("%d:%d %s", m.UID, m.GID, m.Mode)
+	return fmt.Sprintf("%d:%d %s", m.User, m.Group, m.Mode)
 }
 
-func FileMetaFromStat(stat fs.FileInfo) (FileMeta, error) {
+func FileMetaFromStat(stat fs.FileInfo, ug *userGroupMap) (FileMeta, error) {
 	attr, ok := stat.Sys().(*sshfx.Attributes)
 	if !ok {
 		return FileMeta{}, errors.Errorf("expected %T, but got %T for %s", attr, stat.Sys(), stat.Name())
 	}
+	user, err := ug.user(int(attr.UID))
+	if err != nil {
+		return FileMeta{}, err
+	}
+	group, err := ug.group(int(attr.GID))
+	if err != nil {
+		return FileMeta{}, err
+	}
 	return FileMeta{
-		UID:  attr.UID,
-		GID:  attr.GID,
-		Mode: stat.Mode().Perm(),
+		User:  user,
+		Group: group,
+		Mode:  stat.Mode().Perm(),
 	}, nil
 }
 
@@ -105,6 +115,12 @@ func (c *SourceConfig) FileMeta(relDestPath, sourcePath string, dir bool) (FileM
 		}
 	}
 	for pattern, meta := range c.Files {
+		if meta.Group == "" {
+			meta.Group = "root"
+		}
+		if meta.User == "" {
+			meta.User = "root"
+		}
 		match, err := doublestar.Match(pattern, relDestPath)
 		if err != nil {
 			return FileMeta{}, errors.WithStack(err)
@@ -124,7 +140,11 @@ func (c *SourceConfig) FileMeta(relDestPath, sourcePath string, dir bool) (FileM
 		}
 	}
 	// defaults
-	return FileMeta{Mode: mode}, nil
+	return FileMeta{
+		User:  "root",
+		Group: "root",
+		Mode:  mode,
+	}, nil
 }
 
 type File interface {
@@ -132,10 +152,10 @@ type File interface {
 	DestPath() string
 	SourcePath() string
 	DesiredMeta() FileMeta
-	Run(client *sftp.Client) error
+	Run(client *sftp.Client, ug *userGroupMap) error
 }
 
-func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (bool, error) {
+func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options ...write.Option) (bool, error) {
 	var destMeta FileMeta
 	destStat, err := client.LStat(f.DestPath())
 	if err != nil {
@@ -143,7 +163,7 @@ func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (
 			return false, errors.WithStack(err)
 		}
 	} else {
-		destMeta, err = FileMetaFromStat(destStat)
+		destMeta, err = FileMetaFromStat(destStat, ug)
 		if err != nil {
 			return false, errors.WithStack(err)
 		}
@@ -206,6 +226,7 @@ func Diff(client *sftp.Client, f File, out io.Writer, options ...write.Option) (
 
 func atomicallyReplace(
 	client *sftp.Client,
+	ug *userGroupMap,
 	filename string,
 	meta FileMeta,
 	src io.Reader,
@@ -226,7 +247,15 @@ func atomicallyReplace(
 		return err
 	}
 
-	if err := client.Chown(tempPath, int(meta.UID), int(meta.GID)); err != nil {
+	uid, err := ug.uid(meta.User)
+	if err != nil {
+		return err
+	}
+	gid, err := ug.gid(meta.Group)
+	if err != nil {
+		return err
+	}
+	if err := client.Chown(tempPath, uid, gid); err != nil {
 		dst.Close()
 		client.Remove(tempPath)
 		return errors.WithStack(err)
@@ -273,7 +302,7 @@ func (t *FileMkdir) DesiredMeta() FileMeta {
 	return t.meta
 }
 
-func (t *FileMkdir) Run(client *sftp.Client) error {
+func (t *FileMkdir) Run(client *sftp.Client, ug *userGroupMap) error {
 	stat, err := client.Stat(t.destPath)
 	if err != nil {
 		if !serrors.Is(err, fs.ErrNotExist) {
@@ -292,7 +321,15 @@ func (t *FileMkdir) Run(client *sftp.Client) error {
 			}
 		}
 	}
-	if err := client.Chown(t.destPath, int(t.meta.UID), int(t.meta.GID)); err != nil {
+	uid, err := ug.uid(t.meta.User)
+	if err != nil {
+		return err
+	}
+	gid, err := ug.gid(t.meta.Group)
+	if err != nil {
+		return err
+	}
+	if err := client.Chown(t.destPath, uid, gid); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -320,13 +357,13 @@ func (t *FileCopy) DesiredMeta() FileMeta {
 	return t.meta
 }
 
-func (t *FileCopy) Run(client *sftp.Client) error {
+func (t *FileCopy) Run(client *sftp.Client, ug *userGroupMap) error {
 	src, err := os.Open(t.sourcePath)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	defer src.Close()
-	return atomicallyReplace(client, t.destPath, t.meta, src)
+	return atomicallyReplace(client, ug, t.destPath, t.meta, src)
 }
 
 type FileSymlink struct {
@@ -352,7 +389,7 @@ func (t *FileSymlink) DesiredMeta() FileMeta {
 	return t.meta
 }
 
-func (t *FileSymlink) Run(client *sftp.Client) error {
+func (t *FileSymlink) Run(client *sftp.Client, ug *userGroupMap) error {
 	client.Remove(t.destPath) // ignore error
 	if err := client.Symlink(t.targetPath, t.destPath); err != nil {
 		return errors.WithStack(err)
@@ -588,6 +625,85 @@ func (a *App) CmdLs(ctx context.Context, s System, stdout io.Writer) error {
 	return nil
 }
 
+type userGroupMap struct {
+	userToID   map[string]int
+	groupToGID map[string]int
+	idToUser   map[int]string
+	gidToGroup map[int]string
+}
+
+func (ug *userGroupMap) user(id int) (string, error) {
+	user, found := ug.idToUser[id]
+	if !found {
+		return "", errors.Errorf("couldnt map user %d to name", id)
+	}
+	return user, nil
+}
+
+func (ug *userGroupMap) group(id int) (string, error) {
+	group, found := ug.gidToGroup[id]
+	if !found {
+		return "", errors.Errorf("couldnt map group %d to name", id)
+	}
+	return group, nil
+}
+
+func (ug *userGroupMap) uid(user string) (int, error) {
+	uid, found := ug.userToID[user]
+	if !found {
+		return 0, errors.Errorf("couldnt map user %s to id", user)
+	}
+	return uid, nil
+}
+
+func (ug *userGroupMap) gid(group string) (int, error) {
+	gid, found := ug.groupToGID[group]
+	if !found {
+		return 0, errors.Errorf("couldnt map group %s to gid", group)
+	}
+	return gid, nil
+}
+
+func buildUserGroupMap(c *sftp.Client) (*userGroupMap, error) {
+	var ug userGroupMap
+	for _, t := range []struct {
+		strToInt *map[string]int
+		intToStr *map[int]string
+		filename string
+	}{
+		{&ug.userToID, &ug.idToUser, "/etc/passwd"},
+		{&ug.groupToGID, &ug.gidToGroup, "/etc/group"},
+	} {
+		f, err := c.Open(t.filename)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		scanner := bufio.NewScanner(f)
+		l := 0
+		strToInt := make(map[string]int)
+		intToStr := make(map[int]string)
+		for scanner.Scan() {
+			parts := strings.SplitN(scanner.Text(), ":", 4)
+			if len(parts) != 4 {
+				return nil, errors.Errorf("error parsing line number %d in file %q", l, t.filename)
+			}
+			v, err := strconv.ParseInt(parts[2], 10, 64)
+			if err != nil {
+				return nil, errors.Errorf("error parsing id in line number %d in file %q", l, t.filename)
+			}
+			strToInt[parts[0]] = int(v)
+			intToStr[int(v)] = parts[0]
+			l++
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, errors.Errorf("error parsing line number %d in file %q: %v", l, t.filename, err)
+		}
+		*t.intToStr = intToStr
+		*t.strToInt = strToInt
+	}
+	return &ug, nil
+}
+
 func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diffMode bool) error {
 	client, err := connectToHost(s)
 	if err != nil {
@@ -599,6 +715,10 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 		return errors.WithStack(err)
 	}
 	defer sftpClient.Close()
+	ug, err := buildUserGroupMap(sftpClient)
+	if err != nil {
+		return err
+	}
 	files, err := s.Files()
 	if err != nil {
 		return err
@@ -623,7 +743,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 			fmt.Fprintln(&ignore, ignorePath)
 		}
 
-		diff, err := Diff(sftpClient, f, diffOut, diffOptions...)
+		diff, err := Diff(sftpClient, ug, f, diffOut, diffOptions...)
 		if err != nil {
 			return err
 		}
@@ -637,7 +757,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 			fmt.Fprintf(stdout, "changed: %s\n", f.String())
 		}
 		if !diffMode {
-			if err := f.Run(sftpClient); err != nil {
+			if err := f.Run(sftpClient, ug); err != nil {
 				return err
 			}
 		}
@@ -648,7 +768,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 		petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/pets")
 		fmt.Fprintln(&ignore, petsIgnoreFilename)
 		petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
-		if err := atomicallyReplace(sftpClient, petsIgnoreFilename, petsMeta, &ignore); err != nil {
+		if err := atomicallyReplace(sftpClient, ug, petsIgnoreFilename, petsMeta, &ignore); err != nil {
 			return err
 		}
 	}

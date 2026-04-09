@@ -54,5 +54,4 @@ ignoring modified config files.
 
 ### todo
 
-- uid/gid as string for dynamic lookup
 - pull changes to repo
