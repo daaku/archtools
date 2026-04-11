@@ -649,6 +649,9 @@ func (ug *userGroupMap) group(id int) (string, error) {
 }
 
 func (ug *userGroupMap) uid(user string) (int, error) {
+	if user == "" || user == "root" {
+		return 0, nil
+	}
 	uid, found := ug.userToID[user]
 	if !found {
 		return 0, errors.Errorf("couldnt map user %s to id", user)
@@ -657,6 +660,9 @@ func (ug *userGroupMap) uid(user string) (int, error) {
 }
 
 func (ug *userGroupMap) gid(group string) (int, error) {
+	if group == "" || group == "root" {
+		return 0, nil
+	}
 	gid, found := ug.groupToGID[group]
 	if !found {
 		return 0, errors.Errorf("couldnt map group %s to gid", group)
