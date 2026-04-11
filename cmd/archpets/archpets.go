@@ -69,11 +69,11 @@ type FileMeta struct {
 }
 
 func (m *FileMeta) ownerString() string {
-	return fmt.Sprintf("%d:%d", m.User, m.Group)
+	return fmt.Sprintf("%s:%s", m.User, m.Group)
 }
 
 func (m *FileMeta) allString() string {
-	return fmt.Sprintf("%d:%d %s", m.User, m.Group, m.Mode)
+	return fmt.Sprintf("%s:%s %s", m.User, m.Group, m.Mode)
 }
 
 func FileMetaFromStat(stat fs.FileInfo, ug *userGroupMap) (FileMeta, error) {
@@ -704,6 +704,36 @@ func buildUserGroupMap(c *sftp.Client) (*userGroupMap, error) {
 	return &ug, nil
 }
 
+func (a *App) diffOrDeployFile(
+	f File,
+	sftpClient *sftp.Client,
+	ug *userGroupMap,
+	stdout io.Writer,
+	diffOptions []write.Option,
+	diffMode bool,
+) ([]byte, error) {
+	var buf bytes.Buffer
+	diff, err := Diff(sftpClient, ug, f, &buf, diffOptions...)
+	if err != nil {
+		return buf.Bytes(), err
+	}
+	if !diff {
+		if a.Verbose {
+			fmt.Fprintf(stdout, "unchanged: %s\n", f.String())
+		}
+		return buf.Bytes(), nil
+	}
+	if !diffMode || a.Verbose {
+		fmt.Fprintf(stdout, "changed: %s\n", f.String())
+	}
+	if !diffMode {
+		if err := f.Run(sftpClient, ug); err != nil {
+			return buf.Bytes(), err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
 func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diffMode bool) error {
 	client, err := connectToHost(s)
 	if err != nil {
@@ -723,14 +753,13 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 	if err != nil {
 		return err
 	}
-	diffOut := io.Discard
-	if diffMode {
-		diffOut = stdout
-	}
 	var diffOptions []write.Option
 	if a.Color {
 		diffOptions = append(diffOptions, write.TerminalColor())
 	}
+
+	// build updated ignore list in a separate non concurrent loop
+	// to avoid locking complexity.
 	var ignore bytes.Buffer
 	for _, f := range files {
 		ignorePath := f.DestPath()
@@ -742,25 +771,36 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 		if _, ok := f.(*FileMkdir); !ok {
 			fmt.Fprintln(&ignore, ignorePath)
 		}
+	}
 
-		diff, err := Diff(sftpClient, ug, f, diffOut, diffOptions...)
-		if err != nil {
-			return err
+	bufs := make([][]byte, len(files))
+	errs := make([]error, len(files))
+	var wg sync.WaitGroup
+	for i, f := range files {
+		work := func() {
+			bufs[i], errs[i] = a.diffOrDeployFile(f, sftpClient, ug, stdout,
+				diffOptions, diffMode)
 		}
-		if !diff {
-			if a.Verbose {
-				fmt.Fprintf(stdout, "unchanged: %s\n", f.String())
-			}
-			continue
+		// mkdir happens synchronously, since they come in order, ensures correctness.
+		// NOTE: could be optimized by concurrently creating unrelated directories.
+		if _, ok := f.(*FileMkdir); ok {
+			work()
+		} else {
+			wg.Go(work)
 		}
-		if !diffMode || a.Verbose {
-			fmt.Fprintf(stdout, "changed: %s\n", f.String())
+	}
+	wg.Wait()
+
+	// copy output in diff mode, might be useful even in error cases
+	if diffMode {
+		for _, buf := range bufs {
+			stdout.Write(buf)
 		}
-		if !diffMode {
-			if err := f.Run(sftpClient, ug); err != nil {
-				return err
-			}
-		}
+	}
+
+	// if any errors, return them
+	if err := serrors.Join(errs...); err != nil {
+		return err
 	}
 
 	if !diffMode {
