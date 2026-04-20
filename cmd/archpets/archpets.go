@@ -107,10 +107,9 @@ func (c *SourceConfig) FileMeta(relDestPath, sourcePath string, dir bool) (FileM
 	} else {
 		// maintain executable bit if set in filesystem
 		stat, err := os.Stat(sourcePath)
-		if err != nil {
-			return FileMeta{}, errors.WithStack(err)
-		}
-		if stat.Mode()&0o111 != 0 {
+		// ignore errors, since we found the file in walk, it must be an
+		// invalid symlink, in which case the permissions are irrelevant anyway
+		if err == nil && stat.Mode()&0o111 != 0 {
 			mode = 0o755
 		}
 	}
