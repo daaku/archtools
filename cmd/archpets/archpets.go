@@ -893,7 +893,7 @@ var errSentinel = errors.New("sentinel error")
 func run(ctx context.Context) error {
 	a := App{
 		Root:  "/",
-		Repo:  "/home/naitik/workspace/pets",
+		Repo:  "/home/naitik/private/pets",
 		Color: true,
 	}
 	opts.Parse(&a)
