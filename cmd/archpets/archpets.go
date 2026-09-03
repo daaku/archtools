@@ -409,7 +409,7 @@ type System struct {
 	Source       string
 	Host         string `toml:"host"`
 	Port         int    `toml:"port"`
-	Root         string
+	Root         string `toml:"root"`
 	SourceConfig *SourceConfig
 }
 
