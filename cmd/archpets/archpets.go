@@ -769,8 +769,8 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 	var ignore bytes.Buffer
 	for _, f := range files {
 		ignorePath := f.DestPath()
-		if a.Root != "/" {
-			ignorePath = strings.TrimPrefix(ignorePath, a.Root)
+		if s.Root != "/" {
+			ignorePath = strings.TrimPrefix(ignorePath, s.Root)
 		}
 
 		// dont ignore directories
@@ -811,9 +811,12 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 
 	if !diffMode {
 		// FIXME only update if changed
-		petsIgnoreFilename := filepath.Join(a.Root, "/etc/archdiff/pets")
-		fmt.Fprintln(&ignore, petsIgnoreFilename)
+		// the pets manifest lives inside the (custom) root and its ignore
+		// entry is the corresponding root relative path
+		petsIgnorePath := "/etc/archdiff/pets"
+		fmt.Fprintln(&ignore, petsIgnorePath)
 		petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
+		petsIgnoreFilename := filepath.Join(s.Root, petsIgnorePath)
 		if err := atomicallyReplace(sftpClient, ug, petsIgnoreFilename, petsMeta, &ignore); err != nil {
 			return err
 		}
