@@ -199,9 +199,9 @@ func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options 
 		fmt.Fprintln(&destMetaBuf, destMeta.allString())
 		fmt.Fprintln(&desiredMetaBuf, desiredMeta.allString())
 	case *FileSymlink:
-		fmt.Fprintln(&destMetaBuf, destMeta.ownerString())
-		fmt.Fprintln(&desiredMetaBuf, desiredMeta.ownerString())
-
+		// symlink ownership is not managed: it cannot be set via SFTP without
+		// following the link (chowning the target), and it's functionally
+		// irrelevant anyway since links are created as the ssh user (root)
 		if destStat != nil && !destStat.IsDir() && !destStat.Mode().IsRegular() {
 			currentLink, err := client.ReadLink(f.destPath)
 			if err != nil {
