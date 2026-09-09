@@ -432,7 +432,8 @@ func (s *System) walkFunc(files *mutSlice[File], path, destPath string, d fs.Dir
 	}
 
 	if d.IsDir() {
-		if destPath != "/" {
+		// never manage the root dir itself so its permissions stay untouched
+		if destPath != filepath.Clean(s.Root) {
 			files.append(&FileMkdir{
 				sourcePath: path,
 				destPath:   destPath,
