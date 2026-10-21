@@ -2,3 +2,7 @@
 /pkg/
 /src/
 /todo.md
+/archdest
+/archdiff
+/archpets
+*.pkg.tar.zst
