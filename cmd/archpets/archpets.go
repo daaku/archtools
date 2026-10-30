@@ -198,6 +198,29 @@ func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options 
 	case *FileMkdir:
 		fmt.Fprintln(&destMetaBuf, destMeta.allString())
 		fmt.Fprintln(&desiredMetaBuf, desiredMeta.allString())
+	case *FileRemove:
+		// directories are never removed, and a missing file needs no removal,
+		// so both leave the buffers empty which results in no diff
+		if destStat != nil && !destStat.IsDir() {
+			if destStat.Mode()&fs.ModeSymlink != 0 {
+				currentLink, err := client.ReadLink(f.destPath)
+				if err != nil {
+					return false, errors.WithStack(err)
+				}
+				fmt.Fprintln(&destMetaBuf, currentLink)
+			} else {
+				fmt.Fprintln(&destMetaBuf, destMeta.allString())
+				destReader, err := client.Open(f.destPath)
+				if err != nil {
+					return false, errors.WithStack(err)
+				}
+				_, err = io.Copy(&destMetaBuf, destReader)
+				destReader.Close()
+				if err != nil {
+					return false, errors.WithStack(err)
+				}
+			}
+		}
 	case *FileSymlink:
 		// symlink ownership is not managed: it cannot be set via SFTP without
 		// following the link (chowning the target), and it's functionally
@@ -391,6 +414,45 @@ func (t *FileSymlink) DesiredMeta() FileMeta {
 func (t *FileSymlink) Run(client *sftp.Client, ug *userGroupMap) error {
 	client.Remove(t.destPath) // ignore error
 	if err := client.Symlink(t.targetPath, t.destPath); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// FileRemove removes a file that was previously deployed, but is no longer
+// part of the source.
+type FileRemove struct {
+	destPath string
+}
+
+func (t *FileRemove) String() string {
+	return fmt.Sprintf("D %s", t.destPath)
+}
+
+func (t *FileRemove) DestPath() string {
+	return t.destPath
+}
+
+func (t *FileRemove) SourcePath() string {
+	return "/dev/null"
+}
+
+func (t *FileRemove) DesiredMeta() FileMeta {
+	return FileMeta{}
+}
+
+func (t *FileRemove) Run(client *sftp.Client, ug *userGroupMap) error {
+	stat, err := client.LStat(t.destPath)
+	if err != nil {
+		if serrors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	if stat.IsDir() {
+		return nil
+	}
+	if err := client.Remove(t.destPath); err != nil && !serrors.Is(err, fs.ErrNotExist) {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -740,6 +802,39 @@ func (a *App) diffOrDeployFile(
 	return buf.Bytes(), nil
 }
 
+// the pets manifest lives inside the (custom) root and its ignore entry is the
+// corresponding root relative path
+const petsIgnorePath = "/etc/archdiff/pets"
+
+// Removed returns files listed in the previously deployed pets manifest that
+// are no longer part of the current set.
+func (s *System) Removed(client *sftp.Client, current map[string]bool) ([]File, error) {
+	manifest, err := client.Open(filepath.Join(s.Root, petsIgnorePath))
+	if err != nil {
+		if serrors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errors.WithStack(err)
+	}
+	defer manifest.Close()
+	var files []File
+	scanner := bufio.NewScanner(manifest)
+	for scanner.Scan() {
+		ignorePath := scanner.Text()
+		if ignorePath == "" || ignorePath == petsIgnorePath || current[ignorePath] {
+			continue
+		}
+		if !filepath.IsAbs(ignorePath) || filepath.Clean(ignorePath) != ignorePath {
+			return nil, errors.Errorf("invalid path %q in pets manifest", ignorePath)
+		}
+		files = append(files, &FileRemove{destPath: filepath.Join(s.Root, ignorePath)})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return files, nil
+}
+
 func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diffMode bool) error {
 	client, err := connectToHost(s)
 	if err != nil {
@@ -767,6 +862,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 	// build updated ignore list in a separate non concurrent loop
 	// to avoid locking complexity.
 	var ignore bytes.Buffer
+	current := make(map[string]bool)
 	for _, f := range files {
 		ignorePath := f.DestPath()
 		if s.Root != "/" {
@@ -776,8 +872,16 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 		// dont ignore directories
 		if _, ok := f.(*FileMkdir); !ok {
 			fmt.Fprintln(&ignore, ignorePath)
+			current[ignorePath] = true
 		}
 	}
+
+	// removals come first, so a removed file can be replaced by a directory
+	removed, err := s.Removed(sftpClient, current)
+	if err != nil {
+		return err
+	}
+	files = append(removed, files...)
 
 	bufs := make([][]byte, len(files))
 	errs := make([]error, len(files))
@@ -787,11 +891,13 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 			bufs[i], errs[i] = a.diffOrDeployFile(f, sftpClient, ug, stdout,
 				diffOptions, diffMode)
 		}
-		// mkdir happens synchronously, since they come in order, ensures correctness.
+		// mkdir and remove happen synchronously, since they come in order,
+		// ensures correctness.
 		// NOTE: could be optimized by concurrently creating unrelated directories.
-		if _, ok := f.(*FileMkdir); ok {
+		switch f.(type) {
+		case *FileMkdir, *FileRemove:
 			work()
-		} else {
+		default:
 			wg.Go(work)
 		}
 	}
@@ -811,9 +917,6 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 
 	if !diffMode {
 		// FIXME only update if changed
-		// the pets manifest lives inside the (custom) root and its ignore
-		// entry is the corresponding root relative path
-		petsIgnorePath := "/etc/archdiff/pets"
 		fmt.Fprintln(&ignore, petsIgnorePath)
 		petsMeta := FileMeta{Mode: fs.FileMode(0o644)}
 		petsIgnoreFilename := filepath.Join(s.Root, petsIgnorePath)
