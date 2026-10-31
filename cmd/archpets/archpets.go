@@ -194,6 +194,11 @@ func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options 
 			return false, errors.WithStack(err)
 		}
 	case *FileMkdir:
+		// a file with matching metadata must still show as a diff, since a
+		// removal may be replacing it with this directory after the diff
+		if destStat != nil && !destStat.IsDir() {
+			fmt.Fprintln(&destMetaBuf, "not a directory")
+		}
 		fmt.Fprintln(&destMetaBuf, destMeta.allString())
 		fmt.Fprintln(&desiredMetaBuf, desiredMeta.allString())
 	case *FileRemove:
@@ -776,36 +781,6 @@ func buildUserGroupMap(c *sftp.Client) (*userGroupMap, error) {
 	return &ug, nil
 }
 
-func (a *App) diffOrDeployFile(
-	f File,
-	sftpClient *sftp.Client,
-	ug *userGroupMap,
-	stdout io.Writer,
-	diffOptions []write.Option,
-	diffMode bool,
-) ([]byte, error) {
-	var buf bytes.Buffer
-	diff, err := Diff(sftpClient, ug, f, &buf, diffOptions...)
-	if err != nil {
-		return buf.Bytes(), err
-	}
-	if !diff {
-		if a.Verbose {
-			fmt.Fprintf(stdout, "unchanged: %s\n", f.String())
-		}
-		return buf.Bytes(), nil
-	}
-	if !diffMode || a.Verbose {
-		fmt.Fprintf(stdout, "changed: %s\n", f.String())
-	}
-	if !diffMode {
-		if err := f.Run(sftpClient, ug); err != nil {
-			return buf.Bytes(), err
-		}
-	}
-	return buf.Bytes(), nil
-}
-
 // the pets manifest lives inside the (custom) root and its ignore entry is the
 // corresponding root relative path
 const petsIgnorePath = "/etc/archdiff/pets"
@@ -884,21 +859,46 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 	files = append(removed, files...)
 
 	bufs := make([][]byte, len(files))
+	changed := make([]bool, len(files))
 	errs := make([]error, len(files))
 	var wg sync.WaitGroup
+
+	// diffing is read only, so unlike applying changes it needs no ordering
 	for i, f := range files {
-		work := func() {
-			bufs[i], errs[i] = a.diffOrDeployFile(f, sftpClient, ug, stdout,
-				diffOptions, diffMode)
+		wg.Go(func() {
+			var buf bytes.Buffer
+			changed[i], errs[i] = Diff(sftpClient, ug, f, &buf, diffOptions...)
+			bufs[i] = buf.Bytes()
+		})
+	}
+	wg.Wait()
+
+	for i, f := range files {
+		if errs[i] != nil {
+			continue
+		}
+		if !changed[i] {
+			if a.Verbose {
+				fmt.Fprintf(stdout, "unchanged: %s\n", f.String())
+			}
+			continue
+		}
+		if !diffMode || a.Verbose {
+			fmt.Fprintf(stdout, "changed: %s\n", f.String())
+		}
+		if diffMode {
+			continue
 		}
 		// mkdir and remove happen synchronously, since they come in order,
 		// ensures correctness.
 		// NOTE: could be optimized by concurrently creating unrelated directories.
 		switch f.(type) {
 		case *FileMkdir, *FileRemove:
-			work()
+			errs[i] = f.Run(sftpClient, ug)
 		default:
-			wg.Go(work)
+			wg.Go(func() {
+				errs[i] = f.Run(sftpClient, ug)
+			})
 		}
 	}
 	wg.Wait()
