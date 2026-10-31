@@ -30,8 +30,18 @@ import (
 	sshfx "github.com/pkg/sftp/v2/encoding/ssh/filexfer"
 )
 
-// connectTimeout bounds establishing the ssh session and sftp handshake.
-const connectTimeout = 30 * time.Second
+const (
+	// connectTimeout bounds establishing the ssh session and sftp handshake.
+	connectTimeout = 30 * time.Second
+
+	// maxInflight bounds the sftp requests awaiting a response, which is what
+	// limits throughput on high latency links.
+	maxInflight = 1024
+
+	// maxConcurrentFiles bounds the files being processed, and so the handles
+	// open on the server, where the limit is commonly 1024.
+	maxConcurrentFiles = 256
+)
 
 type didDiffWriter struct {
 	io.Writer
@@ -878,10 +888,18 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 	changed := make([]bool, len(files))
 	errs := make([]error, len(files))
 	var wg sync.WaitGroup
+	limit := make(chan struct{}, maxConcurrentFiles)
+	goLimited := func(work func()) {
+		limit <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-limit }()
+			work()
+		})
+	}
 
 	// diffing is read only, so unlike applying changes it needs no ordering
 	for i, f := range files {
-		wg.Go(func() {
+		goLimited(func() {
 			var buf bytes.Buffer
 			changed[i], errs[i] = Diff(sftpClient, ug, f, &buf, diffOptions...)
 			bufs[i] = buf.Bytes()
@@ -912,7 +930,7 @@ func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diff
 		case *FileMkdir, *FileRemove:
 			errs[i] = f.Run(sftpClient, ug)
 		default:
-			wg.Go(func() {
+			goLimited(func() {
 				errs[i] = f.Run(sftpClient, ug)
 			})
 		}
@@ -1004,7 +1022,7 @@ func connectToHost(ctx context.Context, s System) (*sftpSession, error) {
 
 	handshakeCtx, handshakeDone := context.WithTimeout(ctx, connectTimeout)
 	defer handshakeDone()
-	client, err := sftp.NewClientPipe(handshakeCtx, stdout, stdin)
+	client, err := sftp.NewClientPipe(handshakeCtx, stdout, stdin, sftp.WithMaxInflight(maxInflight))
 	if err != nil {
 		cancel()
 		cmd.Wait() // stderr is only safe to read after this
