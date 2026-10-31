@@ -8,10 +8,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"os"
+	"os/exec"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -29,11 +28,10 @@ import (
 	"github.com/pkg/errors"
 	"github.com/pkg/sftp/v2"
 	sshfx "github.com/pkg/sftp/v2/encoding/ssh/filexfer"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
-var currentUser, _ = user.Current()
+// connectTimeout bounds establishing the ssh session and sftp handshake.
+const connectTimeout = 30 * time.Second
 
 type didDiffWriter struct {
 	io.Writer
@@ -470,7 +468,6 @@ type System struct {
 	Name         string
 	Source       string
 	Host         string `toml:"host"`
-	Port         int    `toml:"port"`
 	Root         string `toml:"root"`
 	SourceConfig *SourceConfig
 }
@@ -642,16 +639,23 @@ func (a *App) Init(ctx context.Context) error {
 
 func (a *App) Named(systemName string) (System, error) {
 	source := filepath.Join(a.Repo, "system", systemName)
-	configPath := filepath.Join(source, "config.toml")
-	configBytes, err := os.ReadFile(configPath)
-	if err != nil {
-		return System{}, errors.Errorf("error reading config %q: %v", configPath, err)
+	if _, err := os.Stat(source); err != nil {
+		return System{}, errors.Errorf("error reading system %q: %v", systemName, err)
 	}
 	s := System{
 		Name:         systemName,
+		Host:         systemName,
 		Root:         a.Root,
-		Port:         22,
 		SourceConfig: &a.SourceConfig,
+	}
+	configPath := filepath.Join(source, "config.toml")
+	configBytes, err := os.ReadFile(configPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		s.Source = source
+		return s, nil
+	}
+	if err != nil {
+		return System{}, errors.Errorf("error reading config %q: %v", configPath, err)
 	}
 	err = toml.NewDecoder(bytes.NewReader(configBytes)).
 		DisallowUnknownFields().
@@ -836,16 +840,12 @@ func (s *System) Removed(client *sftp.Client, current map[string]bool) ([]File, 
 }
 
 func (a *App) diffOrDeploy(ctx context.Context, s System, stdout io.Writer, diffMode bool) error {
-	client, err := connectToHost(s)
+	session, err := connectToHost(ctx, s)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
-	sftpClient, err := sftp.NewClient(ctx, client)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer sftpClient.Close()
+	defer session.Close()
+	sftpClient := session.Client
 	ug, err := buildUserGroupMap(sftpClient)
 	if err != nil {
 		return err
@@ -936,57 +936,66 @@ func (a *App) CmdDiff(ctx context.Context, s System, stdout io.Writer) error {
 	return a.diffOrDeploy(ctx, s, stdout, true)
 }
 
-func getDefaultSigners() ([]ssh.Signer, error) {
-	defaults := []string{
-		filepath.Join(currentUser.HomeDir, ".ssh", "id_ed25519"),
-		filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa"),
-		filepath.Join(currentUser.HomeDir, ".ssh", "id_ecdsa"),
-		// FIXME: custom identity file option
-		filepath.Join(currentUser.HomeDir, ".ssh", "aws_ap_south_1_rsa"),
-	}
-	var signers []ssh.Signer
-	for _, f := range defaults {
-		if _, err := os.Stat(f); err == nil {
-			key, err := os.ReadFile(f)
-			if err != nil {
-				continue
-			}
-			signer, err := ssh.ParsePrivateKey(key)
-			if err != nil {
-				continue
-			}
-			signers = append(signers, signer)
-		}
-	}
-	return signers, nil
+// sftpSession is an sftp client running over a system ssh process.
+type sftpSession struct {
+	*sftp.Client
+	cmd    *exec.Cmd
+	cancel context.CancelFunc
 }
 
-func getSSHAuthMethods() []ssh.AuthMethod {
-	methods := []ssh.AuthMethod{ssh.PublicKeysCallback(getDefaultSigners)}
-	if agentSock := os.Getenv("SSH_AUTH_SOCK"); agentSock != "" {
-		conn, err := net.Dial("unix", agentSock)
-		if err == nil {
-			agentClient := agent.NewClient(conn)
-			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
-		}
-	}
-	return methods
+func (s *sftpSession) Close() error {
+	err := s.Client.Close()
+	s.cancel()
+	s.cmd.Wait() // terminated by cancel, so its exit status is meaningless
+	return err
 }
 
-func connectToHost(s System) (*ssh.Client, error) {
-	config := &ssh.ClientConfig{
-		User:            "root",
-		Auth:            getSSHAuthMethods(),
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
-	}
-
-	addr := net.JoinHostPort(s.Host, fmt.Sprint(s.Port))
-	client, err := ssh.Dial("tcp", addr, config)
+// connectToHost runs the system ssh, so host is an alias resolved using the ssh
+// config, including its port, identity, proxy and host key settings. The
+// options match those the sftp command itself passes to ssh.
+func connectToHost(ctx context.Context, s System) (*sftpSession, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-T",
+		"-l", "root",
+		"-o", "BatchMode=yes",
+		"-o", "RemoteCommand=none",
+		"-o", "ForwardX11=no",
+		"-o", "ForwardAgent=no",
+		"-o", "PermitLocalCommand=no",
+		"-o", "ClearAllForwardings=yes",
+		"-s", "--", s.Host, "sftp",
+	)
+	// let ssh shut down any ProxyCommand it started
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 5 * time.Second
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		cancel()
 		return nil, errors.WithStack(err)
 	}
-	return client, nil
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, errors.WithStack(err)
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, errors.WithStack(err)
+	}
+
+	handshakeCtx, handshakeDone := context.WithTimeout(ctx, connectTimeout)
+	defer handshakeDone()
+	client, err := sftp.NewClientPipe(handshakeCtx, stdout, stdin)
+	if err != nil {
+		cancel()
+		cmd.Wait() // stderr is only safe to read after this
+		return nil, errors.Errorf("error connecting to %q: %v: %s",
+			s.Host, err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	return &sftpSession{Client: client, cmd: cmd, cancel: cancel}, nil
 }
 
 var cmds = map[string]func(*App, context.Context, System, io.Writer) error{

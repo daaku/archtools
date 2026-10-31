@@ -14,12 +14,10 @@ require (
 	github.com/pkg/diff v0.0.0-20241224192749-4e6772a4315c
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/sftp/v2 v2.0.0-alpha2
-	golang.org/x/crypto v0.54.0
 )
 
 require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/posener/complete v1.2.3 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 )

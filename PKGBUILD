@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc='tools to manage archlinux systems'
 arch=('x86_64' 'aarch64')
 url="https://$importpath"
-depends=('pacman')
+depends=('pacman' 'openssh')
 makedepends=('go')
 
 build() {
