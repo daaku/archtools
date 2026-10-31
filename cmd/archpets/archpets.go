@@ -152,6 +152,36 @@ type File interface {
 	Run(client *sftp.Client, ug *userGroupMap) error
 }
 
+// readDest appends the contents of the destination file to buf. stat is the
+// result of an LStat of path, and is nil if it does not exist. Reading exactly
+// the known size avoids the speculative reads io.Copy sends until it sees EOF.
+func readDest(client *sftp.Client, path string, stat fs.FileInfo, buf *bytes.Buffer) error {
+	if stat == nil || (stat.Mode().IsRegular() && stat.Size() == 0) {
+		return nil
+	}
+	f, err := client.Open(path)
+	if err != nil {
+		// a dangling symlink
+		if serrors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	defer f.Close()
+	// the size of anything else, like a symlink, isn't that of its contents
+	if !stat.Mode().IsRegular() {
+		_, err := io.Copy(buf, f)
+		return errors.WithStack(err)
+	}
+	b := make([]byte, stat.Size())
+	n, err := f.ReadAt(b, 0)
+	if err != nil && !serrors.Is(err, io.EOF) {
+		return errors.WithStack(err)
+	}
+	buf.Write(b[:n])
+	return nil
+}
+
 func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options ...write.Option) (bool, error) {
 	var destMeta FileMeta
 	destStat, err := client.LStat(f.DestPath())
@@ -175,24 +205,15 @@ func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options 
 		fmt.Fprintln(&destMetaBuf, destMeta.allString())
 		fmt.Fprintln(&desiredMetaBuf, desiredMeta.allString())
 
-		destReader, err := client.Open(f.DestPath())
-		if err != nil {
-			if !serrors.Is(err, fs.ErrNotExist) {
-				return false, errors.WithStack(err)
-			}
-		} else {
-			if _, err := io.Copy(&destMetaBuf, destReader); err != nil {
-				return false, errors.WithStack(err)
-			}
+		if err := readDest(client, f.DestPath(), destStat, &destMetaBuf); err != nil {
+			return false, err
 		}
 
-		desiredReader, err := os.Open(f.sourcePath)
+		desired, err := os.ReadFile(f.sourcePath)
 		if err != nil {
 			return false, errors.WithStack(err)
 		}
-		if _, err := io.Copy(&desiredMetaBuf, desiredReader); err != nil {
-			return false, errors.WithStack(err)
-		}
+		desiredMetaBuf.Write(desired)
 	case *FileMkdir:
 		// a file with matching metadata must still show as a diff, since a
 		// removal may be replacing it with this directory after the diff
@@ -213,14 +234,8 @@ func Diff(client *sftp.Client, ug *userGroupMap, f File, out io.Writer, options 
 				fmt.Fprintln(&destMetaBuf, currentLink)
 			} else {
 				fmt.Fprintln(&destMetaBuf, destMeta.allString())
-				destReader, err := client.Open(f.destPath)
-				if err != nil {
-					return false, errors.WithStack(err)
-				}
-				_, err = io.Copy(&destMetaBuf, destReader)
-				destReader.Close()
-				if err != nil {
-					return false, errors.WithStack(err)
+				if err := readDest(client, f.destPath, destStat, &destMetaBuf); err != nil {
+					return false, err
 				}
 			}
 		}
@@ -755,6 +770,7 @@ func buildUserGroupMap(c *sftp.Client) (*userGroupMap, error) {
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
+		defer f.Close()
 		scanner := bufio.NewScanner(f)
 		l := 0
 		strToInt := make(map[string]int)
